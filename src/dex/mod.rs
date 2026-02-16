@@ -11,6 +11,7 @@ pub mod sundaeswap_v3;
 pub mod wingriders;
 pub mod wingriders_v2;
 pub mod cswap;
+pub mod chadswap;
 pub mod vyfinance;
 pub mod vyfi_bar;
 

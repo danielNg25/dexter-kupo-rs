@@ -4,6 +4,7 @@ mod models;
 mod utils;
 
 use crate::models::asset::token_identifier;
+use dex::chadswap::ChadSwap;
 use dex::cswap::CSwap;
 use dex::minswap_v1::MinswapV1;
 use dex::minswap_v2::MinswapV2;
@@ -88,6 +89,7 @@ fn print_usage(bin: &str) {
     eprintln!("    cswap");
     eprintln!("    vyfinance");
     eprintln!("    minswap_stable  (requires: pool_address asset_a asset_b [decimals_a] [decimals_b])");
+    eprintln!("    chadswap        (requires: token_id — order book query by token)");
     eprintln!();
     eprintln!("  Use 'lovelace' for ADA.");
     eprintln!("  Examples:");
@@ -153,6 +155,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print_usage(&raw_args[0]);
                 std::process::exit(1);
             }
+        }
+        "chadswap" => {
+            // ChadSwap is an order-book DEX; requires: token_id
+            if assets.len() != 1 {
+                eprintln!("chadswap requires exactly 1 positional arg: <token_id>");
+                print_usage(&raw_args[0]);
+                std::process::exit(1);
+            }
+            fetch_chadswap_orders(ChadSwap::new(kupo), &assets[0]).await?;
         }
         "minswap_stable" => {
             // MinswapStable has no pool discovery; requires: pool_address asset_a asset_b [dec_a] [dec_b]
@@ -304,6 +315,22 @@ async fn export_all<D: BaseDex + Send + Sync + 'static>(
         total - pools.len()
     );
 
+    Ok(())
+}
+
+/// ChadSwap: fetch and print the order book for a token.
+async fn fetch_chadswap_orders(
+    dex: ChadSwap,
+    token_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("[chadswap] fetching orders for token: {}", token_id);
+    let book = dex.get_orders_by_token(token_id).await?;
+    eprintln!(
+        "[chadswap] found {} buy orders, {} sell orders",
+        book.buy_orders.len(),
+        book.sell_orders.len()
+    );
+    println!("{}", serde_json::to_string_pretty(&book)?);
     Ok(())
 }
 

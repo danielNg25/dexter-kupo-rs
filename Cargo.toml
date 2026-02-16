@@ -2,6 +2,11 @@
 name = "dexter-kupo-rs"
 version = "0.1.0"
 edition = "2021"
+description = "Rust library for interacting with Cardano DEX protocols via Kupo"
+license = "MIT"
+repository = "https://github.com/your-repo/dexter-kupo-rs"
+keywords = ["cardano", "dex", "defi", "kupo", "lucid"]
+authors = ["Your Name <you@example.com>"]
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json"] }
@@ -13,3 +18,15 @@ thiserror = "1.0"
 hex = "0.4"
 async-trait = "0.1"
 ciborium = "0.2"
+
+[lib]
+name = "dexter_kupo_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dexter-kupo-rs"
+path = "src/main.rs"
+
+[features]
+default = []
+export = []
