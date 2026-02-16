@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Rust library for interacting with Cardano DEX protocols via Kupo"
 license = "MIT"
-repository = "https://github.com/your-repo/dexter-kupo-rs"
+repository = "https://github.com/danielNg25/dexter-kupo-rs"
 keywords = ["cardano", "dex", "defi", "kupo", "lucid"]
-authors = ["Your Name <you@example.com>"]
+authors = ["Daniel Ng <danielng250@gmail.com>"]
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json"] }
