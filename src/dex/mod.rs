@@ -5,12 +5,14 @@ use crate::kupo::KupoApi;
 pub mod cbor;
 pub mod minswap_v1;
 pub mod minswap_v2;
+pub mod minswap_stable;
 pub mod sundaeswap_v1;
 pub mod sundaeswap_v3;
 pub mod wingriders;
 pub mod wingriders_v2;
 pub mod cswap;
 pub mod vyfinance;
+pub mod vyfi_bar;
 
 #[async_trait]
 pub trait BaseDex: Send + Sync {

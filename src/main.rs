@@ -7,9 +7,11 @@ use crate::models::asset::token_identifier;
 use dex::cswap::CSwap;
 use dex::minswap_v1::MinswapV1;
 use dex::minswap_v2::MinswapV2;
+use dex::minswap_stable::MinswapStable;
 use dex::sundaeswap_v1::SundaeSwapV1;
 use dex::sundaeswap_v3::SundaeSwapV3;
 use dex::vyfinance::VyFinance;
+use dex::vyfi_bar::VyfiBar;
 use dex::wingriders::WingRiders;
 use dex::wingriders_v2::WingRidersV2;
 use dex::BaseDex;
@@ -36,6 +38,19 @@ struct PoolExport {
     tx_hash: String,
 }
 
+#[derive(Serialize)]
+struct StablePoolExport {
+    dex: String,
+    pool_id: String,
+    asset_a: String,
+    asset_b: String,
+    reserve_a: String,
+    reserve_b: String,
+    pool_fee_percent: f64,
+    amplification_coefficient: String,
+    total_liquidity: String,
+}
+
 fn pool_to_export(pool: &LiquidityPool, tx_hash: &str) -> PoolExport {
     PoolExport {
         dex: pool.dex_identifier.clone(),
@@ -56,10 +71,15 @@ fn print_usage(bin: &str) {
         "  {} [--dex <dex_name>] [asset_a asset_b]",
         bin
     );
+    eprintln!(
+        "  {} --vyfi-bar <pool_identifier>",
+        bin
+    );
     eprintln!();
     eprintln!("  No args          → export all pools to pools_rs.json");
     eprintln!("  asset_a asset_b  → print matching pools to stdout");
     eprintln!("  --dex            → choose DEX (default: minswap_v2)");
+    eprintln!("  --vyfi-bar       → fetch VyFi Bar rate for a pool identifier");
     eprintln!();
     eprintln!("  Available DEXes:");
     eprintln!("    minswap_v1, minswap_v2");
@@ -67,18 +87,22 @@ fn print_usage(bin: &str) {
     eprintln!("    wingriders, wingriders_v2");
     eprintln!("    cswap");
     eprintln!("    vyfinance");
+    eprintln!("    minswap_stable  (requires: pool_address asset_a asset_b [decimals_a] [decimals_b])");
     eprintln!();
     eprintln!("  Use 'lovelace' for ADA.");
-    eprintln!("  Example:");
+    eprintln!("  Examples:");
     eprintln!("    cargo run --release -- --dex minswap_v1 lovelace f13ac4d66b3ee19a6aa0f2a22298737bd907cc95121662fc971b5275535452494b45");
+    eprintln!("    cargo run --release -- --vyfi-bar 1b727ea428390214a3d053b027ca5c64d9eab2138a6aef64e8896ccc.");
+    eprintln!("    cargo run --release -- --dex minswap_stable addr1wx4w03kq5tfhaad2fmglefgejj0anajcsvvg88w96lrmylc7mx5rm <asset_a> <asset_b> 6 6");
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<String> = std::env::args().collect();
 
-    // Parse --dex flag and positional asset args
+    // Parse --dex / --vyfi-bar flags and positional asset args
     let mut dex_name = "minswap_v2".to_string();
+    let mut vyfi_bar_id: Option<String> = None;
     let mut assets: Vec<String> = Vec::new();
     let mut i = 1;
     while i < raw_args.len() {
@@ -89,6 +113,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
             dex_name = raw_args[i].clone();
+        } else if raw_args[i] == "--vyfi-bar" {
+            i += 1;
+            if i >= raw_args.len() {
+                eprintln!("--vyfi-bar requires a pool identifier");
+                std::process::exit(1);
+            }
+            vyfi_bar_id = Some(raw_args[i].clone());
         } else {
             assets.push(raw_args[i].clone());
         }
@@ -96,6 +127,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let kupo = KupoApi::new(KUPO_URL);
+
+    // --vyfi-bar takes priority over --dex
+    if let Some(pool_id) = vyfi_bar_id {
+        fetch_vyfi_bar_rate(VyfiBar::new(kupo), &pool_id).await?;
+        return Ok(());
+    }
 
     match dex_name.as_str() {
         "minswap_v1" => run(MinswapV1::new(kupo), &assets, &raw_args[0]).await?,
@@ -116,6 +153,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print_usage(&raw_args[0]);
                 std::process::exit(1);
             }
+        }
+        "minswap_stable" => {
+            // MinswapStable has no pool discovery; requires: pool_address asset_a asset_b [dec_a] [dec_b]
+            if assets.len() < 3 {
+                eprintln!("minswap_stable requires at least 3 positional args: <pool_address> <asset_a> <asset_b>");
+                print_usage(&raw_args[0]);
+                std::process::exit(1);
+            }
+            let pool_address = &assets[0];
+            let asset_a = &assets[1];
+            let asset_b = &assets[2];
+            let decimals_a: u8 = assets.get(3).and_then(|s| s.parse().ok()).unwrap_or(6);
+            let decimals_b: u8 = assets.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
+            fetch_stable_pool(
+                MinswapStable::new(kupo),
+                pool_address,
+                asset_a,
+                asset_b,
+                decimals_a,
+                decimals_b,
+            )
+            .await?;
         }
         other => {
             eprintln!(
@@ -245,6 +304,47 @@ async fn export_all<D: BaseDex + Send + Sync + 'static>(
         total - pools.len()
     );
 
+    Ok(())
+}
+
+/// MinswapStable: fetch and print the stable pool by address.
+async fn fetch_stable_pool(
+    dex: MinswapStable,
+    pool_address: &str,
+    asset_a: &str,
+    asset_b: &str,
+    decimals_a: u8,
+    decimals_b: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("[minswap_stable] fetching pool at: {}", pool_address);
+    let pool = dex
+        .get_pool(pool_address, asset_a, asset_b, decimals_a, decimals_b)
+        .await?;
+
+    let export = StablePoolExport {
+        dex: pool.dex_identifier.clone(),
+        pool_id: pool.pool_id.clone(),
+        asset_a: token_identifier(&pool.asset_a),
+        asset_b: token_identifier(&pool.asset_b),
+        reserve_a: pool.reserve_a.to_string(),
+        reserve_b: pool.reserve_b.to_string(),
+        pool_fee_percent: pool.pool_fee_percent,
+        amplification_coefficient: pool.amplification_coefficient.to_string(),
+        total_liquidity: pool.total_liquidity.to_string(),
+    };
+
+    println!("{}", serde_json::to_string_pretty(&export)?);
+    Ok(())
+}
+
+/// VyFi Bar: fetch and print the rate for a single pool identifier.
+async fn fetch_vyfi_bar_rate(
+    dex: VyfiBar,
+    pool_identifier: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("[vyfi_bar] fetching rate for pool: {}", pool_identifier);
+    let rate = dex.get_rate(pool_identifier).await?;
+    println!("{}", serde_json::to_string_pretty(&rate)?);
     Ok(())
 }
 
