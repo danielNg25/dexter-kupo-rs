@@ -16,7 +16,7 @@
 //! | WingRidersV2 | AMM | LiquidityPool | Validity asset + stable detection |
 //! | CSwap | AMM | LiquidityPool | LP token name "63" |
 //! | VyFinance | AMM | LiquidityPool | API + NFT |
-//! | ChadSwap | Order Book | Order/OrderBook | Contract addresses |
+//! | ChadSwap | Order Book | Order/OrderBook | Direct API (no Kupo) |
 //!
 //! ## Quick Start
 //!
@@ -60,8 +60,11 @@
 //! # Query MinswapStable (requires pool address + assets)
 //! cargo run --release -- --dex minswap_stable <pool_addr> <asset_a> <asset_b> 6 6
 //!
-//! # Query ChadSwap order book
+//! # Query ChadSwap order book (by token)
 //! cargo run --release -- --dex chadswap <token_id>
+//!
+//! # Query all ChadSwap order books
+//! cargo run --release -- --dex chadswap_all
 //!
 //! # Query VyFi Bar rate
 //! cargo run --release -- --vyfi-bar <pool_identifier>
