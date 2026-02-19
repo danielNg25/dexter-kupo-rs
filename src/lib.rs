@@ -67,11 +67,14 @@
 //! cargo run --release -- --vyfi-bar <pool_identifier>
 //! ```
 
+pub mod cache;
 pub mod dex;
 pub mod kupo;
 pub mod models;
 pub mod utils;
 
+pub use cache::{load_from_file, save_to_file};
 pub use dex::BaseDex;
+pub use dex::vyfinance::{VyFinanceCache, VyFinancePoolData};
 pub use kupo::KupoApi;
 pub use models::{Asset, LiquidityPool, Order, OrderBook, StablePool, Token, Utxo};

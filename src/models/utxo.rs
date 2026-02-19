@@ -35,6 +35,8 @@ pub struct Utxo {
     pub data_hash: Option<String>,
     pub inline_datum: Option<String>,
     pub reference_script_hash: Option<String>,
+    /// Kupo datum type: "hash" or "inline". Only present when data_hash is set.
+    pub datum_type: Option<String>,
 }
 
 impl Utxo {

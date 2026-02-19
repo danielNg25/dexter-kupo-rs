@@ -85,6 +85,7 @@ impl KupoApi {
                     .unwrap_or_default()
                     .to_string();
                 let datum_hash = v.get("datum_hash").and_then(|d| d.as_str()).map(String::from);
+                let datum_type = v.get("datum_type").and_then(|d| d.as_str()).map(String::from);
                 let script_hash = v.get("script_hash").and_then(|s| s.as_str()).map(String::from);
 
                 let value = v.get("value").unwrap_or(&serde_json::Value::Null);
@@ -132,6 +133,7 @@ impl KupoApi {
                     data_hash: datum_hash,
                     inline_datum: None,
                     reference_script_hash: script_hash,
+                    datum_type,
                 });
             }
             

@@ -18,6 +18,7 @@ thiserror = "1.0"
 hex = "0.4"
 async-trait = "0.1"
 ciborium = "0.2"
+bech32 = "0.11"
 
 [lib]
 name = "dexter_kupo_rs"

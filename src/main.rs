@@ -1,3 +1,4 @@
+mod cache;
 mod dex;
 mod kupo;
 mod models;
@@ -11,7 +12,7 @@ use dex::minswap_v2::MinswapV2;
 use dex::minswap_stable::MinswapStable;
 use dex::sundaeswap_v1::SundaeSwapV1;
 use dex::sundaeswap_v3::SundaeSwapV3;
-use dex::vyfinance::VyFinance;
+use dex::vyfinance::{VyFinance, VyFinanceCache};
 use dex::vyfi_bar::VyfiBar;
 use dex::wingriders::WingRiders;
 use dex::wingriders_v2::WingRidersV2;
@@ -69,7 +70,7 @@ fn pool_to_export(pool: &LiquidityPool, tx_hash: &str) -> PoolExport {
 fn print_usage(bin: &str) {
     eprintln!("Usage:");
     eprintln!(
-        "  {} [--dex <dex_name>] [asset_a asset_b]",
+        "  {} [--dex <dex_name>] [--cache <path>] [asset_a asset_b]",
         bin
     );
     eprintln!(
@@ -80,6 +81,7 @@ fn print_usage(bin: &str) {
     eprintln!("  No args          → export all pools to pools_rs.json");
     eprintln!("  asset_a asset_b  → print matching pools to stdout");
     eprintln!("  --dex            → choose DEX (default: minswap_v2)");
+    eprintln!("  --cache          → path to vyfinance cache JSON file");
     eprintln!("  --vyfi-bar       → fetch VyFi Bar rate for a pool identifier");
     eprintln!();
     eprintln!("  Available DEXes:");
@@ -89,21 +91,21 @@ fn print_usage(bin: &str) {
     eprintln!("    cswap");
     eprintln!("    vyfinance");
     eprintln!("    minswap_stable  (requires: pool_address asset_a asset_b [decimals_a] [decimals_b])");
-    eprintln!("    chadswap        (requires: token_id — order book query by token)");
+    eprintln!("    chadswap          (requires: token_id — order book query by token)");
+    eprintln!("    chadswap_all      (no args — fetch all order books via ChadSwap API)");
     eprintln!();
     eprintln!("  Use 'lovelace' for ADA.");
     eprintln!("  Examples:");
     eprintln!("    cargo run --release -- --dex minswap_v1 lovelace f13ac4d66b3ee19a6aa0f2a22298737bd907cc95121662fc971b5275535452494b45");
-    eprintln!("    cargo run --release -- --vyfi-bar 1b727ea428390214a3d053b027ca5c64d9eab2138a6aef64e8896ccc.");
-    eprintln!("    cargo run --release -- --dex minswap_stable addr1wx4w03kq5tfhaad2fmglefgejj0anajcsvvg88w96lrmylc7mx5rm <asset_a> <asset_b> 6 6");
+    eprintln!("    cargo run --release -- --dex vyfinance --cache vyfi_cache.json lovelace f13ac4d66b3ee19a6aa0f2a22298737bd907cc95121662fc971b5275535452494b45");
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<String> = std::env::args().collect();
 
-    // Parse --dex / --vyfi-bar flags and positional asset args
     let mut dex_name = "minswap_v2".to_string();
+    let mut cache_path: Option<String> = None;
     let mut vyfi_bar_id: Option<String> = None;
     let mut assets: Vec<String> = Vec::new();
     let mut i = 1;
@@ -115,6 +117,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
             dex_name = raw_args[i].clone();
+        } else if raw_args[i] == "--cache" {
+            i += 1;
+            if i >= raw_args.len() {
+                eprintln!("--cache requires a path");
+                std::process::exit(1);
+            }
+            cache_path = Some(raw_args[i].clone());
         } else if raw_args[i] == "--vyfi-bar" {
             i += 1;
             if i >= raw_args.len() {
@@ -130,7 +139,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let kupo = KupoApi::new(KUPO_URL);
 
-    // --vyfi-bar takes priority over --dex
     if let Some(pool_id) = vyfi_bar_id {
         fetch_vyfi_bar_rate(VyfiBar::new(kupo), &pool_id).await?;
         return Ok(());
@@ -145,10 +153,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "wingriders_v2" => run(WingRidersV2::new(kupo), &assets, &raw_args[0]).await?,
         "cswap" => run(CSwap::new(kupo), &assets, &raw_args[0]).await?,
         "vyfinance" => {
-            // VyFinance uses a special path: API discovery → per-pool Kupo queries
             let dex = VyFinance::new(kupo);
             if assets.len() == 2 {
-                fetch_pair(dex, &assets[0], &assets[1]).await?;
+                let cache = if let Some(path) = &cache_path {
+                    match cache::load_from_file::<VyFinanceCache>(path) {
+                        Ok(c) => Some(c),
+                        Err(_) => {
+                            eprintln!("Cache file not found or invalid. Fetching from API...");
+                            let pool_data = dex.fetch_all_pool_data().await?;
+                            let c = VyFinance::structure_pool_data(pool_data);
+                            let _ = cache::save_to_file(&c, path);
+                            Some(c)
+                        }
+                    }
+                } else {
+                    None
+                };
+                
+                eprintln!("Querying pools for {} / {}...", assets[0], assets[1]);
+                let pools = dex.liquidity_pools_from_token_cached(&assets[1], &assets[0], cache.as_ref()).await?;
+                if pools.is_empty() {
+                    eprintln!("No pools found.");
+                } else {
+                    eprintln!("Found {} pool(s).", pools.len());
+                    let exports: Vec<PoolExport> = pools.iter().map(|p| pool_to_export(p, "")).collect();
+                    println!("{}", serde_json::to_string_pretty(&exports)?);
+                }
             } else if assets.is_empty() {
                 export_all_vyfinance(dex).await?;
             } else {
@@ -157,16 +187,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "chadswap" => {
-            // ChadSwap is an order-book DEX; requires: token_id
             if assets.len() != 1 {
                 eprintln!("chadswap requires exactly 1 positional arg: <token_id>");
                 print_usage(&raw_args[0]);
                 std::process::exit(1);
             }
-            fetch_chadswap_orders(ChadSwap::new(kupo), &assets[0]).await?;
+            fetch_chadswap_orders(ChadSwap::new(), &assets[0]).await?;
+        }
+        "chadswap_all" => {
+            let dex = ChadSwap::new();
+            let books = dex.get_all_order_books().await?;
+            eprintln!("[chadswap] found order books for {} tokens", books.len());
+            println!("{}", serde_json::to_string_pretty(&books)?);
         }
         "minswap_stable" => {
-            // MinswapStable has no pool discovery; requires: pool_address asset_a asset_b [dec_a] [dec_b]
             if assets.len() < 3 {
                 eprintln!("minswap_stable requires at least 3 positional args: <pool_address> <asset_a> <asset_b>");
                 print_usage(&raw_args[0]);
@@ -269,7 +303,6 @@ async fn export_all<D: BaseDex + Send + Sync + 'static>(
                         return None;
                     }
                 };
-                // extend fetches the datum for accurate reserves/fee
                 match dex
                     .liquidity_pool_from_utxo_extend(utxo, &base.pool_id)
                     .await
@@ -318,7 +351,6 @@ async fn export_all<D: BaseDex + Send + Sync + 'static>(
     Ok(())
 }
 
-/// ChadSwap: fetch and print the order book for a token.
 async fn fetch_chadswap_orders(
     dex: ChadSwap,
     token_id: &str,
@@ -334,7 +366,6 @@ async fn fetch_chadswap_orders(
     Ok(())
 }
 
-/// MinswapStable: fetch and print the stable pool by address.
 async fn fetch_stable_pool(
     dex: MinswapStable,
     pool_address: &str,
@@ -364,7 +395,6 @@ async fn fetch_stable_pool(
     Ok(())
 }
 
-/// VyFi Bar: fetch and print the rate for a single pool identifier.
 async fn fetch_vyfi_bar_rate(
     dex: VyfiBar,
     pool_identifier: &str,
@@ -375,7 +405,6 @@ async fn fetch_vyfi_bar_rate(
     Ok(())
 }
 
-/// VyFinance-specific export: uses the API-discovery path, bypasses generic export_all.
 async fn export_all_vyfinance(dex: VyFinance) -> Result<(), Box<dyn std::error::Error>> {
     let pools = dex.all_liquidity_pools().await?;
     let exports: Vec<PoolExport> = pools.iter().map(|p| pool_to_export(p, "")).collect();

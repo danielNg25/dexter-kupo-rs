@@ -21,6 +21,19 @@ let pools = dex.liquidity_pools_from_token("lovelace", "<token_id>").await?;
 // Returns Vec<LiquidityPool>
 ```
 
+### Query VyFinance (with optional caching)
+```rust
+use dexter_kupo_rs::dex::vyfinance::VyFinance;
+
+let dex = VyFinance::new(kupo);
+
+// Without cache (fetches from API each time)
+let pools = dex.liquidity_pools_from_token("lovelace", "<token_id>").await?;
+
+// With cache (faster - see Cache section below)
+let pools = dex.liquidity_pools_from_token_cached("lovelace", "<token_id>", Some(&cache)).await?;
+```
+
 ### Query MinswapStable (Curve-style)
 ```rust
 use dexter_kupo_rs::dex::MinswapStable;
@@ -34,9 +47,16 @@ let pool = stable.get_pool(pool_addr, asset_a, asset_b, decimals_a, decimals_b).
 ```rust
 use dexter_kupo_rs::dex::ChadSwap;
 
-let chadswap = ChadSwap::new(kupo);
+// ChadSwap fetches directly from api.chadswap.com — no Kupo required
+let chadswap = ChadSwap::new();
+
+// Single token
 let book = chadswap.get_orders_by_token("<token_id>").await?;
 // Returns OrderBook { token_id, buy_orders, sell_orders }
+
+// All tokens at once
+let books = chadswap.get_all_order_books().await?;
+// Returns HashMap<String, OrderBook>
 ```
 
 ### Query VyFi Bar Rate
@@ -50,19 +70,19 @@ let rate = vyfibar.get_rate("<pool_identifier>").await?;
 
 ## DEX Classes
 
-| Class | File | Use For |
-|-------|------|---------|
-| `MinswapV1` | `dex/minswap_v1.rs` | Minswap V1 pools |
-| `MinswapV2` | `dex/minswap_v2.rs` | Minswap V2 pools |
-| `MinswapStable` | `dex/minswap_stable.rs` | Minswap stable (Curve-style) |
-| `SundaeSwapV1` | `dex/sundaeswap_v1.rs` | SundaeSwap V1 pools |
-| `SundaeSwapV3` | `dex/sundaeswap_v3.rs` | SundaeSwap V3 pools |
-| `WingRiders` | `dex/wingriders.rs` | WingRiders V1 pools |
-| `WingRidersV2` | `dex/wingriders_v2.rs` | WingRiders V2 pools |
-| `CSwap` | `dex/cswap.rs` | CSwap pools |
-| `VyFinance` | `dex/vyfinance.rs` | VyFinance pools |
-| `ChadSwap` | `dex/chadswap.rs` | ChadSwap order book |
-| `VyfiBar` | `dex/vyfi_bar.rs` | VyFi staking rates |
+| Class | File | Use For | Caching |
+|-------|------|---------|---------|
+| `MinswapV1` | `dex/minswap_v1.rs` | Minswap V1 pools | N/A |
+| `MinswapV2` | `dex/minswap_v2.rs` | Minswap V2 pools | N/A |
+| `MinswapStable` | `dex/minswap_stable.rs` | Minswap stable (Curve-style) | N/A |
+| `SundaeSwapV1` | `dex/sundaeswap_v1.rs` | SundaeSwap V1 pools | N/A |
+| `SundaeSwapV3` | `dex/sundaeswap_v3.rs` | SundaeSwap V3 pools | N/A |
+| `WingRiders` | `dex/wingriders.rs` | WingRiders V1 pools | N/A |
+| `WingRidersV2` | `dex/wingriders_v2.rs` | WingRiders V2 pools | N/A |
+| `CSwap` | `dex/cswap.rs` | CSwap pools | N/A |
+| `VyFinance` | `dex/vyfinance.rs` | VyFinance pools | **Supported** |
+| `ChadSwap` | `dex/chadswap.rs` | ChadSwap order book (via API, no Kupo) | N/A |
+| `VyfiBar` | `dex/vyfi_bar.rs` | VyFi staking rates | N/A |
 
 ## Models
 
@@ -144,6 +164,16 @@ pub struct Asset {
 }
 ```
 
+### Cache Helpers (for VyFinance)
+
+```rust
+use dexter_kupo_rs::cache::{load_from_file, save_to_file};
+
+// Save/Load JSON cache files
+save_to_file(&data, "cache.json")?;
+let data: MyType = load_from_file("cache.json")?;
+```
+
 ### Utxo
 ```rust
 pub struct Utxo {
@@ -194,6 +224,26 @@ pub trait BaseDex: Send + Sync {
 }
 ```
 
+## VyFinance Caching
+
+VyFinance uses an external API for pool metadata. Cache the metadata and pass it to avoid repeated API calls:
+
+```rust
+use dexter_kupo_rs::cache::{load_from_file, save_to_file};
+use dexter_kupo_rs::dex::vyfinance::{VyFinance, VyFinanceCache};
+
+// Build cache once
+let pool_data = dex.fetch_all_pool_data().await?;
+let cache = VyFinance::structure_pool_data(pool_data);
+save_to_file(&cache, "cache.json")?;
+
+// Use cache
+let cache = load_from_file::<VyFinanceCache>("cache.json")?;
+let pools = dex.liquidity_pools_from_token_cached("lovelace", "token", Some(&cache)).await?;
+```
+
+CLI: `cargo run --release -- --dex vyfinance --cache cache.json lovelace <token>`
+
 ## Error Handling
 
 All async methods return `Result<T, anyhow::Error>`. Use `?` for propagation.
@@ -207,11 +257,17 @@ cargo run --release -- --dex minswap_v2
 # Query pair
 cargo run --release -- --dex minswap_v1 lovelace <token_id>
 
+# VyFinance (use --cache for faster repeated queries)
+cargo run --release -- --dex vyfinance --cache cache.json lovelace <token_id>
+
 # Stable pool
 cargo run --release -- --dex minswap_stable <pool_addr> <asset_a> <asset_b> 6 6
 
-# Order book
+# Order book for a specific token
 cargo run --release -- --dex chadswap <token_id>
+
+# All order books (all tokens)
+cargo run --release -- --dex chadswap_all
 
 # VyFi rate
 cargo run --release -- --vyfi-bar <pool_identifier>
