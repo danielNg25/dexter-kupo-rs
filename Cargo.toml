@@ -1,6 +1,6 @@
 [package]
 name = "dexter-kupo-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Rust library for interacting with Cardano DEX protocols via Kupo"
 license = "MIT"
