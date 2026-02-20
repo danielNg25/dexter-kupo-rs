@@ -123,7 +123,6 @@ impl BaseDex for MinswapV1 {
     /// then filters client-side. No datum fetch needed.
     async fn liquidity_pools_from_token(&self, token_b: &str, token_a: &str) -> Result<Vec<LiquidityPool>> {
         let all_utxos = self.all_liquidity_pool_utxos().await?;
-        eprintln!("[minswap_v1] fetched {} pool UTXOs", all_utxos.len());
 
         let mut pools = Vec::new();
         for utxo in &all_utxos {
