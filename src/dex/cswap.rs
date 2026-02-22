@@ -11,7 +11,6 @@ const POOL_ADDRESS: &str =
     "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e";
 /// LP tokens are identified by their asset name hex being exactly "63"
 const LP_TOKEN_NAME_HEX: &str = "63";
-const ADA_RESERVE_DEDUCTION: u64 = 2_000_000;
 
 pub struct CSwap {
     kupo: KupoApi,
@@ -120,20 +119,8 @@ impl BaseDex for CSwap {
         let a_unit = &relevant[a_idx].unit;
         let b_unit = &relevant[b_idx].unit;
 
-        let raw_a = relevant[a_idx].quantity.parse::<u64>()?;
-        let raw_b = relevant[b_idx].quantity.parse::<u64>()?;
-
-        // ADA reserve: subtract 2 ADA (protocol minimum)
-        let reserve_a = if a_unit == "lovelace" {
-            raw_a.saturating_sub(ADA_RESERVE_DEDUCTION)
-        } else {
-            raw_a
-        };
-        let reserve_b = if b_unit == "lovelace" {
-            raw_b.saturating_sub(ADA_RESERVE_DEDUCTION)
-        } else {
-            raw_b
-        };
+        let reserve_a = relevant[a_idx].quantity.parse::<u64>()?;
+        let reserve_b = relevant[b_idx].quantity.parse::<u64>()?;
 
         let asset_a = from_identifier(a_unit, 0);
         let asset_b = from_identifier(b_unit, 0);
