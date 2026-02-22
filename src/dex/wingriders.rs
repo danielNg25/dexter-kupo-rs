@@ -60,16 +60,9 @@ fn parse_pool_datum(cbor_hex: &str) -> Result<WRDatum> {
     Ok(WRDatum { treasury_a, treasury_b })
 }
 
-/// Apply the WingRiders ADA minimum deduction.
-/// JS logic: if (qty - MIN_POOL_ADA < 1_000_000) use (qty - MIN_POOL_ADA) else use qty
-/// In practice for any reasonable pool this always subtracts MIN_POOL_ADA.
+/// Subtract the 3 ADA min-UTXO deposit from pool ADA reserves.
 fn ada_reserve(qty: u64) -> u64 {
-    let diff = qty.saturating_sub(MIN_POOL_ADA);
-    if diff < 1_000_000 {
-        diff
-    } else {
-        qty
-    }
+    qty.saturating_sub(MIN_POOL_ADA)
 }
 
 #[async_trait]

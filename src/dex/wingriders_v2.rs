@@ -51,6 +51,8 @@ struct WRV2Datum {
     reserve_fee: u64,
     treasury_a: u64,
     treasury_b: u64,
+    project_treasury_a: u64,
+    project_treasury_b: u64,
     is_stable: bool,
 }
 
@@ -72,9 +74,20 @@ fn parse_pool_datum(cbor_hex: &str) -> Result<WRV2Datum> {
     let treasury_a = value_to_u64(&fields[12])?;
     let treasury_b = value_to_u64(&fields[13])?;
 
-    // Stable pool detection: field [20] exists AND is a non-empty constr.
-    // Regular pools have CBORTag(121, []) = Plutus Nothing at [20] → NOT stable.
-    // Stable pools have CBORTag(121, [int, int, int]) with WingRidersV2Special fields → stable.
+    // Fields [14] and [15] hold the project fee treasury (accumulated from ProjectFeeInBasis).
+    // Pools with ProjectFeeInBasis=0 will have these as 0.
+    let project_treasury_a = if fields.len() > 14 {
+        value_to_u64(&fields[14]).unwrap_or(0)
+    } else {
+        0
+    };
+    let project_treasury_b = if fields.len() > 15 {
+        value_to_u64(&fields[15]).unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Stable pool detection: last constr field that is non-empty.
     let is_stable = fields.len() > 20 && is_nonempty_constr(&fields[20]);
 
     Ok(WRV2Datum {
@@ -84,13 +97,15 @@ fn parse_pool_datum(cbor_hex: &str) -> Result<WRV2Datum> {
         reserve_fee,
         treasury_a,
         treasury_b,
+        project_treasury_a,
+        project_treasury_b,
         is_stable,
     })
 }
 
+/// Subtract the 3 ADA min-UTXO deposit from pool ADA reserves.
 fn ada_reserve(qty: u64) -> u64 {
-    let diff = qty.saturating_sub(MIN_POOL_ADA);
-    if diff < 1_000_000 { diff } else { qty }
+    qty.saturating_sub(MIN_POOL_ADA)
 }
 
 #[async_trait]
@@ -196,8 +211,8 @@ impl BaseDex for WingRidersV2 {
             return Ok(None);
         }
 
-        pool.reserve_a = pool.reserve_a.saturating_sub(d.treasury_a);
-        pool.reserve_b = pool.reserve_b.saturating_sub(d.treasury_b);
+        pool.reserve_a = pool.reserve_a.saturating_sub(d.treasury_a).saturating_sub(d.project_treasury_a);
+        pool.reserve_b = pool.reserve_b.saturating_sub(d.treasury_b).saturating_sub(d.project_treasury_b);
         pool.pool_fee_percent =
             (d.swap_fee + d.protocol_fee + d.project_fee + d.reserve_fee) as f64 / 100.0;
 
