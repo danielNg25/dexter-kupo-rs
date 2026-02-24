@@ -10,7 +10,7 @@ use crate::models::{LiquidityPool, Utxo};
 use super::BaseDex;
 use super::cbor::{constr_fields, decode_cbor, value_to_u64};
 
-const IDENTIFIER: &str = "VYFINANCE";
+const IDENTIFIER: &str = "VyFinance";
 const VYFI_API_URL: &str = "https://api.vyfi.io/lp?networkId=1&v2=true";
 const CONCURRENCY: usize = 5;
 

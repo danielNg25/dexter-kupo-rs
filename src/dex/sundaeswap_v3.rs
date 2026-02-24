@@ -6,7 +6,7 @@ use crate::models::{token_identifier, LiquidityPool, Utxo};
 use super::BaseDex;
 use super::cbor::{constr_fields, decode_cbor, value_to_u64, value_to_i64};
 
-const IDENTIFIER: &str = "SUNDAESWAPV3";
+const IDENTIFIER: &str = "SundaeSwapV3";
 // Two pool contract addresses — pools live at both
 const POOL_ADDRESS_V1: &str =
     "addr1x8srqftqemf0mjlukfszd97ljuxdp44r372txfcr75wrz26rnxqnmtv3hdu2t6chcfhl2zzjh36a87nmd6dwsu3jenqsslnz7e";

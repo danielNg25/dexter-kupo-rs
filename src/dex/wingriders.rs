@@ -6,7 +6,7 @@ use crate::models::{token_identifier, LiquidityPool, Utxo};
 use super::BaseDex;
 use super::cbor::{constr_fields, decode_cbor, value_to_u64};
 
-const IDENTIFIER: &str = "WINGRIDER";
+const IDENTIFIER: &str = "WingRiders";
 const POOL_VALIDITY_POLICY: &str = "026a18d04a0c642759bb3d83b12e3344894e5c1c7b2aeb1a2113a570";
 /// Kupo query pattern (policy.name with dot)
 const POOL_VALIDITY_ASSET: &str = "026a18d04a0c642759bb3d83b12e3344894e5c1c7b2aeb1a2113a570.4c";

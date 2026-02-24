@@ -9,7 +9,7 @@ use super::cbor::{constr_fields, value_to_u64, parse_asset_constr, decode_cbor};
 const LP_TOKEN_POLICY_ID: &str = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
 const POOL_VALIDITY_ASSET: &str = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c4d5350";
 const POOL_SCRIPT_HASH_BECH32: &str = "script1agrmwv7exgffcdu27cn5xmnuhsh0p0ukuqpkhdgm800xksw7e2w";
-const IDENTIFIER: &str = "MINSWAPV2";
+const IDENTIFIER: &str = "MinswapV2";
 
 pub struct MinswapV2 {
     kupo: KupoApi,

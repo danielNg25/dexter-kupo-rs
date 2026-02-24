@@ -6,7 +6,7 @@ use crate::models::{token_identifier, LiquidityPool, Utxo};
 use super::BaseDex;
 use super::cbor::{constr_fields, decode_cbor, value_to_u64};
 
-const IDENTIFIER: &str = "SUNDAESWAPV1";
+const IDENTIFIER: &str = "SundaeSwapV1";
 const POOL_ADDRESS: &str = "addr1w9qzpelu9hn45pefc0xr4ac4kdxeswq7pndul2vuj59u8tqaxdznu";
 const LP_TOKEN_POLICY_ID: &str = "0029cb7c88c7567b63d1a512c0ed626aa169688ec980730c0473b913";
 

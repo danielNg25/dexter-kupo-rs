@@ -6,7 +6,7 @@ use crate::models::{token_identifier, LiquidityPool, Utxo};
 use super::BaseDex;
 use super::cbor::{constr_fields, decode_cbor, value_to_u64};
 
-const IDENTIFIER: &str = "CSWAP";
+const IDENTIFIER: &str = "CSwap";
 const POOL_ADDRESS: &str =
     "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e";
 /// LP tokens are identified by their asset name hex being exactly "63"

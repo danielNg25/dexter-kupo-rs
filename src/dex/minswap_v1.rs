@@ -5,7 +5,7 @@ use crate::models::asset::{from_identifier, token_identifier};
 use crate::kupo::KupoApi;
 use super::BaseDex;
 
-const IDENTIFIER: &str = "MINSWAP";
+const IDENTIFIER: &str = "MinswapV1";
 const LP_TOKEN_POLICY_ID: &str = "e4214b7cce62ac6fbba385d164df48e157eae5863521b4b67ca71d86";
 const POOL_NFT_POLICY_ID: &str = "0be55d262b29f564998ff81efe21bdc0022621c12f15af08d0f2ddb1";
 // The validity asset is queried as <policy>.<name> — Kupo returns UTXOs containing it

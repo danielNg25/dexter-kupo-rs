@@ -6,7 +6,7 @@ use crate::models::{token_identifier, LiquidityPool, Utxo};
 use super::BaseDex;
 use super::cbor::{constr_fields, decode_cbor, is_nonempty_constr, value_to_u64};
 
-const IDENTIFIER: &str = "WINGRIDERV2";
+const IDENTIFIER: &str = "WingRidersV2";
 const POOL_VALIDITY_POLICY: &str = "6fdc63a1d71dc2c65502b79baae7fb543185702b12c3c5fb639ed737";
 const POOL_VALIDITY_ASSET: &str = "6fdc63a1d71dc2c65502b79baae7fb543185702b12c3c5fb639ed737.4c";
 const POOL_VALIDITY_ASSET_JOINED: &str =
