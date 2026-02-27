@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use crate::kupo::KupoApi;
 use crate::models::asset::from_identifier;
 use crate::models::{LiquidityPool, Utxo};
@@ -16,6 +16,7 @@ const CONCURRENCY: usize = 5;
 
 pub struct VyFinance {
     kupo: KupoApi,
+    cache: RwLock<Option<VyFinanceCache>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -38,7 +39,39 @@ pub type VyFinanceCache = HashMap<String, HashMap<String, Vec<VyFinancePoolData>
 
 impl VyFinance {
     pub fn new(kupo: KupoApi) -> Self {
-        Self { kupo }
+        Self {
+            kupo,
+            cache: RwLock::new(None),
+        }
+    }
+
+    /// Look up the units_pair for a pool_id from the cache.
+    async fn find_units_pair_for_pool_id(&self, pool_id: &str) -> Option<String> {
+        let guard = self.cache.read().await;
+        let cache = guard.as_ref()?;
+        for inner in cache.values() {
+            for pools in inner.values() {
+                for p in pools {
+                    if p.pool_nft_policy_id == pool_id {
+                        return Some(p.units_pair.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Ensure the cache is populated. Fetches from VyFi API on first call, reuses after.
+    async fn ensure_cache(&self) -> Result<()> {
+        // Fast path: cache already populated
+        if self.cache.read().await.is_some() {
+            return Ok(());
+        }
+        // Slow path: fetch and populate
+        let all = self.fetch_all_pool_data().await?;
+        let structured = Self::structure_pool_data(all);
+        *self.cache.write().await = Some(structured);
+        Ok(())
     }
 
     /// Fetch all pool metadata from VyFi API.
@@ -152,6 +185,7 @@ impl VyFinance {
             if nft_id.is_empty() {
                 continue;
             }
+            let pair = pool_data.units_pair.clone();
             let sem = Arc::clone(&sem);
             let kupo_url = kupo_url.clone();
 
@@ -168,7 +202,7 @@ impl VyFinance {
                 };
 
                 let utxo = utxos.into_iter().next()?;
-                build_pool_from_utxo(&utxo, &nft_id, &kupo).await
+                build_pool_from_utxo(&utxo, &nft_id, &kupo, Some(&pair)).await
             });
 
             handles.push(handle);
@@ -204,6 +238,7 @@ impl VyFinance {
             if nft_id.is_empty() {
                 continue;
             }
+            let pair = pool_data.units_pair.clone();
             let sem = Arc::clone(&sem);
             let kupo_url = kupo_url.clone();
 
@@ -212,7 +247,7 @@ impl VyFinance {
                 let kupo = KupoApi::new(&kupo_url);
                 let utxos = kupo.get(&nft_id, true).await.ok()?;
                 let utxo = utxos.into_iter().next()?;
-                build_pool_from_utxo(&utxo, &nft_id, &kupo).await
+                build_pool_from_utxo(&utxo, &nft_id, &kupo, Some(&pair)).await
             });
             handles.push(handle);
         }
@@ -228,7 +263,17 @@ impl VyFinance {
 }
 
 /// Build a LiquidityPool from a VyFinance UTXO with datum.
-async fn build_pool_from_utxo(utxo: &Utxo, pool_nft_id: &str, kupo: &KupoApi) -> Option<LiquidityPool> {
+///
+/// `units_pair` (e.g. "tokenA/tokenB") provides the canonical token ordering from
+/// the VyFi API. The datum's bar_fee fields correspond to this ordering, NOT to
+/// the UTXO asset ordering from Kupo. When provided, bar_fees are matched to the
+/// correct assets.
+async fn build_pool_from_utxo(
+    utxo: &Utxo,
+    pool_nft_id: &str,
+    kupo: &KupoApi,
+    units_pair: Option<&str>,
+) -> Option<LiquidityPool> {
     if utxo.data_hash.is_none() {
         return None;
     }
@@ -257,8 +302,28 @@ async fn build_pool_from_utxo(utxo: &Utxo, pool_nft_id: &str, kupo: &KupoApi) ->
     let datum = kupo.datum(data_hash).await.ok()?;
     let d = parse_pool_datum(&datum).ok()?;
 
-    let reserve_a = raw_a.saturating_sub(d.bar_fee_a);
-    let reserve_b = raw_b.saturating_sub(d.bar_fee_b);
+    // Datum bar_fee fields correspond to the units_pair ordering from VyFi API,
+    // not the UTXO asset ordering. Check if UTXO asset_a matches the first token
+    // in units_pair; if not, swap bar_fees.
+    let (fee_for_a, fee_for_b) = if let Some(pair) = units_pair {
+        let pair_tokens: Vec<&str> = pair.split('/').collect();
+        if pair_tokens.len() == 2 {
+            let first_token = pair_tokens[0].replace('.', "");
+            let utxo_a_unit = &relevant[a_idx].unit;
+            if *utxo_a_unit == first_token {
+                (d.bar_fee_a, d.bar_fee_b)
+            } else {
+                (d.bar_fee_b, d.bar_fee_a)
+            }
+        } else {
+            (d.bar_fee_a, d.bar_fee_b)
+        }
+    } else {
+        (d.bar_fee_a, d.bar_fee_b)
+    };
+
+    let reserve_a = raw_a.saturating_sub(fee_for_a);
+    let reserve_b = raw_b.saturating_sub(fee_for_b);
 
     Some(LiquidityPool {
         dex_identifier: IDENTIFIER.to_string(),
@@ -321,7 +386,8 @@ impl BaseDex for VyFinance {
         utxo: &Utxo,
         pool_id: &str,
     ) -> Result<Option<LiquidityPool>> {
-        Ok(build_pool_from_utxo(utxo, pool_id, &self.kupo).await)
+        let units_pair = self.find_units_pair_for_pool_id(pool_id).await;
+        Ok(build_pool_from_utxo(utxo, pool_id, &self.kupo, units_pair.as_deref()).await)
     }
 
     async fn liquidity_pool_from_pool_id(&self, pool_id: &str) -> Result<Option<LiquidityPool>> {
@@ -333,9 +399,11 @@ impl BaseDex for VyFinance {
             pool_id.to_string()
         };
 
+        let units_pair = self.find_units_pair_for_pool_id(pool_id).await;
+
         let utxos = self.kupo.get(&nft, true).await?;
         match utxos.first() {
-            Some(utxo) => Ok(build_pool_from_utxo(utxo, pool_id, &self.kupo).await),
+            Some(utxo) => Ok(build_pool_from_utxo(utxo, pool_id, &self.kupo, units_pair.as_deref()).await),
             None => Ok(None),
         }
     }
@@ -345,6 +413,8 @@ impl BaseDex for VyFinance {
         token_b: &str,
         token_a: &str,
     ) -> Result<Vec<LiquidityPool>> {
-        self.liquidity_pools_from_token_cached(token_b, token_a, None).await
+        self.ensure_cache().await?;
+        let guard = self.cache.read().await;
+        self.liquidity_pools_from_token_cached(token_b, token_a, guard.as_ref()).await
     }
 }

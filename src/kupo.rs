@@ -10,7 +10,7 @@ pub struct KupoApi {
 impl KupoApi {
     pub fn new(api_url: &str) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300)) // 5 minutes for large queries
+            .timeout(std::time::Duration::from_secs(30)) // 30s — fail fast so refresh retries don't block for minutes
             .build()
             .expect("Failed to build HTTP client");
         Self {
