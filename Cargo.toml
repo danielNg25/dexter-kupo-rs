@@ -12,7 +12,7 @@ authors = ["Daniel Ng <danielng250@gmail.com>"]
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 anyhow = "1.0"
 thiserror = "1.0"
 hex = "0.4"
