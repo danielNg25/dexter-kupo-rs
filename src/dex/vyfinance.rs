@@ -298,8 +298,13 @@ async fn build_pool_from_utxo(
     let asset_a = from_identifier(&relevant[a_idx].unit, 0);
     let asset_b = from_identifier(&relevant[b_idx].unit, 0);
 
-    let data_hash = utxo.data_hash.as_ref()?;
-    let datum = kupo.datum(data_hash).await.ok()?;
+    let datum = match &utxo.inline_datum {
+        Some(d) => d.clone(),
+        None => {
+            let data_hash = utxo.data_hash.as_ref()?;
+            kupo.datum(data_hash).await.ok()?
+        }
+    };
     let d = parse_pool_datum(&datum).ok()?;
 
     // Datum bar_fee fields correspond to the units_pair ordering from VyFi API,

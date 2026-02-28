@@ -78,7 +78,10 @@ impl MinswapStable {
             None => return Ok(None),
         };
 
-        let datum_cbor = self.kupo.datum(&data_hash).await?;
+        let datum_cbor = match &utxo.inline_datum {
+            Some(d) => d.clone(),
+            None => self.kupo.datum(&data_hash).await?,
+        };
         let datum = parse_stable_datum(&datum_cbor).map_err(|e| {
             anyhow!("Failed parsing stable datum at {}: {}", utxo.address, e)
         })?;

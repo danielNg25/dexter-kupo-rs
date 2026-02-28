@@ -203,7 +203,10 @@ impl BaseDex for WingRidersV2 {
             None => return Ok(None),
         };
 
-        let datum = self.kupo.datum(data_hash).await?;
+        let datum = match &utxo.inline_datum {
+            Some(d) => d.clone(),
+            None => self.kupo.datum(data_hash).await?,
+        };
         let d = parse_pool_datum(&datum)?;
 
         // Skip stable pools (matches JS: returns undefined when WingRidersV2Special found)

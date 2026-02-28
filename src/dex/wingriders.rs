@@ -161,7 +161,10 @@ impl BaseDex for WingRiders {
             None => return Ok(None),
         };
 
-        let datum = self.kupo.datum(data_hash).await?;
+        let datum = match &utxo.inline_datum {
+            Some(d) => d.clone(),
+            None => self.kupo.datum(data_hash).await?,
+        };
         let d = parse_pool_datum(&datum)?;
 
         pool.reserve_a = pool.reserve_a.saturating_sub(d.treasury_a);

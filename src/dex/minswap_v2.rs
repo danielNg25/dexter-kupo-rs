@@ -42,7 +42,10 @@ impl MinswapV2 {
             None => return Ok(None),
         };
 
-        let datum = self.kupo.datum(data_hash).await?;
+        let datum = match &utxo.inline_datum {
+            Some(d) => d.clone(),
+            None => self.kupo.datum(data_hash).await?,
+        };
         let parsed = parse_pool_datum(&datum)?;
 
         // Skip Zap pools (asset B policy == LP token policy), same as JS

@@ -153,7 +153,10 @@ impl BaseDex for CSwap {
             None => return Ok(None),
         };
 
-        let datum = self.kupo.datum(data_hash).await?;
+        let datum = match &utxo.inline_datum {
+            Some(d) => d.clone(),
+            None => self.kupo.datum(data_hash).await?,
+        };
         let d = parse_pool_datum(&datum)?;
 
         pool.total_lp_tokens = d.total_lp;
