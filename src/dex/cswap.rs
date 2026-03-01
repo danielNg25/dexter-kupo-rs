@@ -119,8 +119,12 @@ impl BaseDex for CSwap {
         let a_unit = &relevant[a_idx].unit;
         let b_unit = &relevant[b_idx].unit;
 
-        let reserve_a = relevant[a_idx].quantity.parse::<u64>()?;
-        let reserve_b = relevant[b_idx].quantity.parse::<u64>()?;
+        // CSwap locks 2 ADA (min UTXO) in the pool that cannot be traded.
+        // The smart contract uses (R_ada - 2_000_000) as the effective ADA reserve.
+        let raw_a: u64 = relevant[a_idx].quantity.parse()?;
+        let raw_b: u64 = relevant[b_idx].quantity.parse()?;
+        let reserve_a = if *a_unit == "lovelace" { raw_a.saturating_sub(2_000_000) } else { raw_a };
+        let reserve_b = if *b_unit == "lovelace" { raw_b.saturating_sub(2_000_000) } else { raw_b };
 
         let asset_a = from_identifier(a_unit, 0);
         let asset_b = from_identifier(b_unit, 0);
@@ -160,7 +164,8 @@ impl BaseDex for CSwap {
         let d = parse_pool_datum(&datum)?;
 
         pool.total_lp_tokens = d.total_lp;
-        pool.pool_fee_percent = d.lp_fee as f64 / 100.0;
+        // CSwap total fee = LP fee + 15 bps protocol fee
+        pool.pool_fee_percent = (d.lp_fee + 15) as f64 / 100.0;
 
         Ok(Some(pool))
     }
