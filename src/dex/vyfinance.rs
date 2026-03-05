@@ -1,14 +1,14 @@
+use super::cbor::{constr_fields, decode_cbor, value_to_u64};
+use super::BaseDex;
+use crate::kupo::KupoApi;
+use crate::models::asset::from_identifier;
+use crate::models::{LiquidityPool, Utxo};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
-use crate::kupo::KupoApi;
-use crate::models::asset::from_identifier;
-use crate::models::{LiquidityPool, Utxo};
-use super::BaseDex;
-use super::cbor::{constr_fields, decode_cbor, value_to_u64};
 
 const IDENTIFIER: &str = "VyFinance";
 const VYFI_API_URL: &str = "https://api.vyfi.io/lp?networkId=1&v2=true";
@@ -164,10 +164,9 @@ impl VyFinance {
             all.into_iter()
                 .filter(|p| {
                     let tokens: Vec<&str> = p.units_pair.split('/').collect();
-                    tokens.len() == 2 && (
-                        (tokens[0] == token_a && tokens[1] == token_b) ||
-                        (tokens[0] == token_b && tokens[1] == token_a)
-                    )
+                    tokens.len() == 2
+                        && ((tokens[0] == token_a && tokens[1] == token_b)
+                            || (tokens[0] == token_b && tokens[1] == token_a))
                 })
                 .collect()
         };
@@ -195,8 +194,7 @@ impl VyFinance {
 
                 let utxos = match kupo.get(&nft_id, true).await {
                     Ok(u) => u,
-                    Err(e) => {
-                        eprintln!("[vyfinance] kupo error for {}: {}", nft_id, e);
+                    Err(_e) => {
                         return None;
                     }
                 };
@@ -217,7 +215,6 @@ impl VyFinance {
 
         Ok(pools)
     }
-
 }
 
 /// Build a LiquidityPool from a VyFinance UTXO with datum.
@@ -312,14 +309,21 @@ fn parse_pool_datum(cbor_hex: &str) -> Result<VyFiDatum> {
     let fields = constr_fields(&value)?;
 
     if fields.len() < 3 {
-        return Err(anyhow!("VyFinance datum: expected >=3 fields, got {}", fields.len()));
+        return Err(anyhow!(
+            "VyFinance datum: expected >=3 fields, got {}",
+            fields.len()
+        ));
     }
 
     let bar_fee_a = value_to_u64(&fields[0])?;
     let bar_fee_b = value_to_u64(&fields[1])?;
     let total_lp = value_to_u64(&fields[2])?;
 
-    Ok(VyFiDatum { bar_fee_a, bar_fee_b, total_lp })
+    Ok(VyFiDatum {
+        bar_fee_a,
+        bar_fee_b,
+        total_lp,
+    })
 }
 
 #[async_trait]
@@ -366,7 +370,9 @@ impl BaseDex for VyFinance {
 
         let utxos = self.kupo.get(&nft, true).await?;
         match utxos.first() {
-            Some(utxo) => Ok(build_pool_from_utxo(utxo, pool_id, &self.kupo, units_pair.as_deref()).await),
+            Some(utxo) => {
+                Ok(build_pool_from_utxo(utxo, pool_id, &self.kupo, units_pair.as_deref()).await)
+            }
             None => Ok(None),
         }
     }
@@ -378,20 +384,19 @@ impl BaseDex for VyFinance {
     ) -> Result<Vec<LiquidityPool>> {
         self.ensure_cache().await?;
         let guard = self.cache.read().await;
-        self.liquidity_pools_from_token_cached(token_b, token_a, guard.as_ref()).await
+        self.liquidity_pools_from_token_cached(token_b, token_a, guard.as_ref())
+            .await
     }
 
     async fn all_liquidity_pools(&self) -> Result<Vec<LiquidityPool>> {
         let pool_data = self.fetch_all_pool_data().await?;
         let cache = Self::structure_pool_data(pool_data);
 
-        let pool_datas: Vec<VyFinancePoolData> = cache.into_values()
+        let pool_datas: Vec<VyFinancePoolData> = cache
+            .into_values()
             .flat_map(|m| m.into_values())
             .flatten()
             .collect();
-
-        let empty_nft_count = pool_datas.iter().filter(|p| p.pool_nft_policy_id.is_empty()).count();
-        eprintln!("[vyfinance] all_pools: {} pool_datas, {} with empty NFT (skipped)", pool_datas.len(), empty_nft_count);
 
         let kupo_url = self.kupo.api_url().to_string();
         let sem = Arc::new(Semaphore::new(CONCURRENCY));
@@ -411,37 +416,30 @@ impl BaseDex for VyFinance {
                 let kupo = KupoApi::new(&kupo_url);
                 let utxos = match kupo.get(&nft_id, true).await {
                     Ok(u) => u,
-                    Err(e) => {
-                        eprintln!("[vyfinance] all_pools: kupo error for {}: {}", nft_id, e);
+                    Err(_e) => {
                         return None;
                     }
                 };
                 let utxo = match utxos.into_iter().next() {
                     Some(u) => u,
                     None => {
-                        eprintln!("[vyfinance] all_pools: no UTXO for NFT {}", nft_id);
                         return None;
                     }
                 };
                 match build_pool_from_utxo(&utxo, &nft_id, &kupo, Some(&pair)).await {
                     Some(pool) => Some(pool),
-                    None => {
-                        eprintln!("[vyfinance] all_pools: build_pool_from_utxo returned None for {}", nft_id);
-                        None
-                    }
+                    None => None,
                 }
             });
             handles.push(handle);
         }
 
-        let num_candidates = handles.len();
         let mut pools = Vec::new();
         for handle in handles {
             if let Ok(Some(pool)) = handle.await {
                 pools.push(pool);
             }
         }
-        eprintln!("[vyfinance] all_pools: built {} pools from {} candidates", pools.len(), num_candidates);
         Ok(pools)
     }
 }
