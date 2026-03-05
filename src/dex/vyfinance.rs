@@ -218,48 +218,6 @@ impl VyFinance {
         Ok(pools)
     }
 
-    pub async fn all_liquidity_pools(&self) -> Result<Vec<LiquidityPool>> {
-        let pool_data = self.fetch_all_pool_data().await?;
-        let cache = Self::structure_pool_data(pool_data);
-        
-        // We want ALL pools, but liquidity_pools_from_token_cached is for pairs.
-        // For export_all, we just use the flattened pool data.
-        let pool_datas: Vec<VyFinancePoolData> = cache.into_values()
-            .flat_map(|m| m.into_values())
-            .flatten()
-            .collect();
-
-        let kupo_url = self.kupo.api_url().to_string();
-        let sem = Arc::new(Semaphore::new(CONCURRENCY));
-        let mut handles = Vec::with_capacity(pool_datas.len());
-
-        for pool_data in pool_datas {
-            let nft_id = pool_data.pool_nft_policy_id.clone();
-            if nft_id.is_empty() {
-                continue;
-            }
-            let pair = pool_data.units_pair.clone();
-            let sem = Arc::clone(&sem);
-            let kupo_url = kupo_url.clone();
-
-            let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                let kupo = KupoApi::new(&kupo_url);
-                let utxos = kupo.get(&nft_id, true).await.ok()?;
-                let utxo = utxos.into_iter().next()?;
-                build_pool_from_utxo(&utxo, &nft_id, &kupo, Some(&pair)).await
-            });
-            handles.push(handle);
-        }
-
-        let mut pools = Vec::new();
-        for handle in handles {
-            if let Ok(Some(pool)) = handle.await {
-                pools.push(pool);
-            }
-        }
-        Ok(pools)
-    }
 }
 
 /// Build a LiquidityPool from a VyFinance UTXO with datum.
@@ -421,5 +379,69 @@ impl BaseDex for VyFinance {
         self.ensure_cache().await?;
         let guard = self.cache.read().await;
         self.liquidity_pools_from_token_cached(token_b, token_a, guard.as_ref()).await
+    }
+
+    async fn all_liquidity_pools(&self) -> Result<Vec<LiquidityPool>> {
+        let pool_data = self.fetch_all_pool_data().await?;
+        let cache = Self::structure_pool_data(pool_data);
+
+        let pool_datas: Vec<VyFinancePoolData> = cache.into_values()
+            .flat_map(|m| m.into_values())
+            .flatten()
+            .collect();
+
+        let empty_nft_count = pool_datas.iter().filter(|p| p.pool_nft_policy_id.is_empty()).count();
+        eprintln!("[vyfinance] all_pools: {} pool_datas, {} with empty NFT (skipped)", pool_datas.len(), empty_nft_count);
+
+        let kupo_url = self.kupo.api_url().to_string();
+        let sem = Arc::new(Semaphore::new(CONCURRENCY));
+        let mut handles = Vec::with_capacity(pool_datas.len());
+
+        for pool_data in pool_datas {
+            let nft_id = pool_data.pool_nft_policy_id.clone();
+            if nft_id.is_empty() {
+                continue;
+            }
+            let pair = pool_data.units_pair.clone();
+            let sem = Arc::clone(&sem);
+            let kupo_url = kupo_url.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let kupo = KupoApi::new(&kupo_url);
+                let utxos = match kupo.get(&nft_id, true).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("[vyfinance] all_pools: kupo error for {}: {}", nft_id, e);
+                        return None;
+                    }
+                };
+                let utxo = match utxos.into_iter().next() {
+                    Some(u) => u,
+                    None => {
+                        eprintln!("[vyfinance] all_pools: no UTXO for NFT {}", nft_id);
+                        return None;
+                    }
+                };
+                match build_pool_from_utxo(&utxo, &nft_id, &kupo, Some(&pair)).await {
+                    Some(pool) => Some(pool),
+                    None => {
+                        eprintln!("[vyfinance] all_pools: build_pool_from_utxo returned None for {}", nft_id);
+                        None
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        let num_candidates = handles.len();
+        let mut pools = Vec::new();
+        for handle in handles {
+            if let Ok(Some(pool)) = handle.await {
+                pools.push(pool);
+            }
+        }
+        eprintln!("[vyfinance] all_pools: built {} pools from {} candidates", pools.len(), num_candidates);
+        Ok(pools)
     }
 }

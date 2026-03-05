@@ -47,9 +47,22 @@ pub trait BaseDex: Send + Sync {
         pool_id: &str
     ) -> Result<Option<LiquidityPool>, anyhow::Error>;
     
+    async fn all_liquidity_pools(&self) -> Result<Vec<LiquidityPool>, anyhow::Error> {
+        let utxos = self.all_liquidity_pool_utxos().await?;
+        let mut pools = Vec::new();
+        for utxo in &utxos {
+            match self.liquidity_pool_from_utxo(utxo, "").await {
+                Ok(Some(pool)) => pools.push(pool),
+                Ok(None) => {}
+                Err(e) => eprintln!("[{}] pool parse error {}: {}", self.identifier(), utxo.tx_hash, e),
+            }
+        }
+        Ok(pools)
+    }
+
     async fn liquidity_pools_from_token(
-        &self, 
-        token_b: &str, 
+        &self,
+        token_b: &str,
         token_a: &str
     ) -> Result<Vec<LiquidityPool>, anyhow::Error>;
 }
