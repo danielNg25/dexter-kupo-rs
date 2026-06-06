@@ -61,7 +61,24 @@ pub fn script_and_stake_to_base_address(
     script_hash_hex: &str,
     stake_key_hash_hex: &str,
 ) -> Result<String> {
-    unimplemented!("Task 8")
+    let script = hex::decode(script_hash_hex)
+        .map_err(|e| anyhow!("invalid script hash hex: {}", e))?;
+    let stake = hex::decode(stake_key_hash_hex)
+        .map_err(|e| anyhow!("invalid stake key hash hex: {}", e))?;
+    if script.len() != 28 {
+        return Err(anyhow!("script hash must be 28 bytes, got {}", script.len()));
+    }
+    if stake.len() != 28 {
+        return Err(anyhow!("stake key hash must be 28 bytes, got {}", stake.len()));
+    }
+    // Header byte 0x11: addr type 1 (script payment + key stake), mainnet (net 1).
+    let mut payload: Vec<u8> = Vec::with_capacity(1 + 28 + 28);
+    payload.push(0x11);
+    payload.extend_from_slice(&script);
+    payload.extend_from_slice(&stake);
+    let hrp = bech32::Hrp::parse("addr").map_err(|e| anyhow!("bech32 HRP error: {}", e))?;
+    bech32::encode::<bech32::Bech32>(hrp, &payload)
+        .map_err(|e| anyhow!("bech32 encode error: {}", e))
 }
 
 #[cfg(test)]
@@ -93,5 +110,22 @@ mod tests {
         // hrp = "addr_test" → reject because we require mainnet "addr".
         let testnet = "addr_test1qpu2pq49jsjz5n4dsec5x2j8gx5tn5lp0c5l07x8t0t8ydqkvfvjs7tva8ytkj0dfllt6rze4kzg7ds20j5xqa7yz0sq2yvnz9";
         assert!(decode_base_address(testnet).is_err());
+    }
+
+    const ORDER_SCRIPT_HASH: &str = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
+    const SENDER_STAKE_KH_2: &str = "43f42529ba296fb3fbbbd14817897731219a5339d35195aa6e7d6b22";
+    const ORDER_ADDR: &str =
+        "addr1z8p79rpkcdz8x9d6tft0x0dx5mwuzac2sa4gm8cvkw5hcnzr7sjjnw3fd7elhw73fqtcjae3yxd9xwwn2x265mnadv3qhj56am";
+
+    #[test]
+    fn derive_v2_order_address_from_script_hash_and_stake() {
+        let got = script_and_stake_to_base_address(ORDER_SCRIPT_HASH, SENDER_STAKE_KH_2).unwrap();
+        assert_eq!(got, ORDER_ADDR);
+    }
+
+    #[test]
+    fn rejects_wrong_length_hashes() {
+        assert!(script_and_stake_to_base_address("abcd", SENDER_STAKE_KH_2).is_err());
+        assert!(script_and_stake_to_base_address(ORDER_SCRIPT_HASH, "abcd").is_err());
     }
 }
