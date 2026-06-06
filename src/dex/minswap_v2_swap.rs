@@ -5,12 +5,12 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::address::{script_and_stake_to_base_address, WalletAddress};
+use crate::address::{decode_base_address, script_and_stake_to_base_address, WalletAddress};
 use crate::dex::minswap_v2::MinswapV2;
 use crate::dex::DexSwap;
 use crate::models::{token_identifier, LiquidityPool, Token, Utxo};
 use crate::plutus::PlutusData;
-use crate::requests::{AddressType, AssetAmount, PayToAddress, SwapFee, SwapParams};
+use crate::requests::{AddressType, AssetAmount, PayToAddress, PlutusScript, PlutusVersion, SpendUtxo, SwapFee, SwapParams};
 
 /// Returns `(reserve_for_token, reserve_for_other)` ordered to match `token`.
 fn corresponding_reserves(pool: &LiquidityPool, token: &Token) -> (u128, u128) {
@@ -75,6 +75,11 @@ fn compute_direction(swap_in: &Token, swap_out: &Token) -> u64 {
     let in_u = unit_for_sort(swap_in);
     let out_u = unit_for_sort(swap_out);
     if in_u <= out_u { 1 } else { 0 }
+}
+
+/// Match a UTxO whose address's payment credential is the V2 order script hash.
+fn payment_credential_is_order_script(addr: &str) -> bool {
+    matches!(decode_base_address(addr), Ok(w) if w.payment_key_hash == ORDER_SCRIPT_HASH)
 }
 
 /// Build the 9-field V2 OrderDatum.
@@ -257,8 +262,36 @@ impl DexSwap for MinswapV2 {
             spend_utxos: vec![],
         }])
     }
-    fn build_cancel_order(&self, _order_utxos: &[Utxo], _return_address: &str) -> Result<Vec<PayToAddress>> {
-        Err(anyhow!("Task 15"))
+    fn build_cancel_order(&self, order_utxos: &[Utxo], return_address: &str) -> Result<Vec<PayToAddress>> {
+        let order_utxo = order_utxos
+            .iter()
+            .find(|u| payment_credential_is_order_script(&u.address))
+            .ok_or_else(|| anyhow!("no UTxO at the V2 order script address"))?;
+
+        // Return all assets of the order UTxO to the caller.
+        let mut assets: Vec<AssetAmount> = Vec::with_capacity(order_utxo.amount.len());
+        for unit in &order_utxo.amount {
+            let qty = unit.quantity.parse::<u64>()
+                .map_err(|e| anyhow!("order utxo asset quantity not u64: {}", e))?;
+            assets.push(AssetAmount { unit: unit.unit.clone(), quantity: qty });
+        }
+
+        Ok(vec![PayToAddress {
+            address: return_address.to_string(),
+            address_type: AddressType::Base,
+            assets,
+            datum: None,
+            is_inline_datum: false,
+            spend_utxos: vec![SpendUtxo {
+                utxo: order_utxo.clone(),
+                redeemer: Some(CANCEL_REDEEMER.to_string()),
+                validator: Some(PlutusScript {
+                    version: PlutusVersion::V2,
+                    cbor_hex: ORDER_SCRIPT_CBOR_HEX.to_string(),
+                }),
+                signer: Some(return_address.to_string()),
+            }],
+        }])
     }
 }
 
@@ -322,5 +355,66 @@ mod tests {
         let pool = ada_token_pool(1_000_000_000_000, 5_000_000_000_000, 0.3);
         let pi = dex().price_impact_percent(&pool, &Token::Lovelace, 100_000_000);
         assert!(pi > 0.0 && pi < 1.0, "price impact = {}", pi);
+    }
+
+    #[test]
+    fn build_cancel_order_picks_the_order_utxo_and_emits_redeemer() {
+        use crate::models::Utxo;
+        use crate::dex::minswap_v2_swap::{ORDER_SCRIPT_HASH, CANCEL_REDEEMER, ORDER_SCRIPT_CBOR_HEX};
+        use crate::requests::PlutusVersion;
+
+        // Two UTxOs — one at the order script address, one at an unrelated base address.
+        let order_addr = "addr1z8p79rpkcdz8x9d6tft0x0dx5mwuzac2sa4gm8cvkw5hcnzr7sjjnw3fd7elhw73fqtcjae3yxd9xwwn2x265mnadv3qhj56am".to_string();
+        let unrelated  = "addr1qyfd4vf3pwalnfxucjut2xx653s9ukguwnlrnjjq4qvld76r7sjjnw3fd7elhw73fqtcjae3yxd9xwwn2x265mnadv3qyun95l".to_string();
+
+        let make_utxo = |address: String, ada: u64| Utxo {
+            address,
+            tx_hash: "00".repeat(32),
+            tx_index: 0,
+            output_index: 0,
+            amount: vec![crate::models::Unit { unit: "lovelace".into(), quantity: ada.to_string() }],
+            block: String::new(),
+            data_hash: Some("ab".repeat(32)),
+            inline_datum: None,
+            reference_script_hash: None,
+            datum_type: None,
+        };
+
+        let utxos = vec![
+            make_utxo(unrelated.clone(), 5_000_000),
+            make_utxo(order_addr.clone(), 2_004_000_000),
+        ];
+
+        let pays = dex().build_cancel_order(&utxos, &unrelated).expect("cancel build");
+        assert_eq!(pays.len(), 1);
+        let p = &pays[0];
+        assert_eq!(p.address, unrelated, "funds return to the caller");
+        assert_eq!(p.spend_utxos.len(), 1);
+        let s = &p.spend_utxos[0];
+        assert_eq!(s.utxo.address, order_addr);
+        assert_eq!(s.redeemer.as_deref(), Some(CANCEL_REDEEMER));
+        let v = s.validator.as_ref().expect("validator");
+        assert_eq!(v.version, PlutusVersion::V2);
+        assert_eq!(v.cbor_hex, ORDER_SCRIPT_CBOR_HEX);
+        assert_eq!(s.signer.as_deref(), Some(unrelated.as_str()));
+    }
+
+    #[test]
+    fn build_cancel_order_errors_when_no_order_utxo() {
+        use crate::models::Utxo;
+        let unrelated = "addr1qyfd4vf3pwalnfxucjut2xx653s9ukguwnlrnjjq4qvld76r7sjjnw3fd7elhw73fqtcjae3yxd9xwwn2x265mnadv3qyun95l".to_string();
+        let other = Utxo {
+            address: unrelated.clone(),
+            tx_hash: "00".repeat(32),
+            tx_index: 0,
+            output_index: 0,
+            amount: vec![crate::models::Unit { unit: "lovelace".into(), quantity: "5000000".into() }],
+            block: String::new(),
+            data_hash: None,
+            inline_datum: None,
+            reference_script_hash: None,
+            datum_type: None,
+        };
+        assert!(dex().build_cancel_order(&[other], &unrelated).is_err());
     }
 }
