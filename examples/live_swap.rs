@@ -8,6 +8,9 @@
 //! Env vars can be set via standard `export FOO=bar` in your shell, OR by
 //! creating a `.env` file in the working directory with `FOO=bar` lines.
 //! (`.env` is already in `.gitignore` — your mnemonics stay out of commits.)
+//! **Important**: Values containing spaces (e.g., the BIP-39 mnemonic) MUST be
+//! wrapped in double quotes in `.env`. For example:
+//!   `SENDER_MNEMONIC="word1 word2 word3 ... word24"`
 //!
 //! REQUIRED ENV VARS:
 //!   KUPO_URL               local Kupo API URL (http://localhost:1442)
@@ -72,7 +75,29 @@ const HARDENED: u32 = 0x8000_0000;
 async fn main() -> Result<()> {
     // Auto-load .env from the current working directory if present. Silently ignored
     // if no .env file exists — the example still works with pure shell `export` vars.
-    let _ = dotenvy::dotenv();
+    match dotenvy::dotenv() {
+        Ok(path) => {
+            eprintln!(".env loaded from {}", path.display());
+        }
+        Err(dotenvy::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No .env file; fine, vars may be set via shell exports.
+        }
+        Err(dotenvy::Error::LineParse(_, idx)) => {
+            eprintln!(
+                ".env parse error at line offset {}. \
+                 Common cause: a value containing spaces is not wrapped in quotes. \
+                 Wrap multi-word values like SENDER_MNEMONIC in double quotes: \
+                 SENDER_MNEMONIC=\"word1 word2 ...\". \
+                 (Offending line content suppressed to avoid leaking secrets.)",
+                idx
+            );
+        }
+        Err(e) => {
+            // Some other dotenvy error — print only the variant name, not the inner content,
+            // to avoid accidentally leaking secret values.
+            eprintln!(".env error: {:?} (details suppressed)", std::mem::discriminant(&e));
+        }
+    }
 
     let args: Vec<String> = env::args().collect();
     let submit = args.iter().any(|a| a == "--submit");
