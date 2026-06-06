@@ -7,8 +7,26 @@ use anyhow::{anyhow, Result};
 
 use crate::dex::minswap_v2::MinswapV2;
 use crate::dex::DexSwap;
-use crate::models::{LiquidityPool, Token, Utxo};
+use crate::models::{token_identifier, LiquidityPool, Token, Utxo};
 use crate::requests::{PayToAddress, SwapFee, SwapParams};
+
+/// Returns `(reserve_for_token, reserve_for_other)` ordered to match `token`.
+fn corresponding_reserves(pool: &LiquidityPool, token: &Token) -> (u128, u128) {
+    let token_id = token_identifier(token);
+    let a_id = token_identifier(&pool.asset_a);
+    if token_id == a_id {
+        (pool.reserve_a as u128, pool.reserve_b as u128)
+    } else {
+        (pool.reserve_b as u128, pool.reserve_a as u128)
+    }
+}
+
+fn fee_mods(pool_fee_percent: f64) -> (u128, u128) {
+    let mult: u128 = 10_000;
+    // round-half-away-from-zero, mirroring dexter's Math.round
+    let modifier = mult - (((pool_fee_percent / 100.0) * mult as f64).round() as u128);
+    (mult, modifier)
+}
 
 /// Minswap V2 order script hash — payment credential of every V2 order address.
 pub const ORDER_SCRIPT_HASH: &str = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
@@ -30,14 +48,39 @@ impl DexSwap for MinswapV2 {
         "MinswapV2"
     }
 
-    fn estimated_receive(&self, _pool: &LiquidityPool, _in_token: &Token, _in_amount: u64) -> u64 {
-        unimplemented!("Task 12")
+    fn estimated_receive(&self, pool: &LiquidityPool, in_token: &Token, in_amount: u64) -> u64 {
+        let (mult, modifier) = fee_mods(pool.pool_fee_percent);
+        let (r_in, r_out) = corresponding_reserves(pool, in_token);
+        let in_amt = in_amount as u128;
+        let num = in_amt * r_out * modifier;
+        let den = in_amt * modifier + r_in * mult;
+        (num / den) as u64
     }
-    fn estimated_give(&self, _pool: &LiquidityPool, _out_token: &Token, _out_amount: u64) -> u64 {
-        unimplemented!("Task 12")
+    fn estimated_give(&self, pool: &LiquidityPool, out_token: &Token, out_amount: u64) -> u64 {
+        let (mult, modifier) = fee_mods(pool.pool_fee_percent);
+        let (r_out, r_in) = corresponding_reserves(pool, out_token);
+        let out_amt = out_amount as u128;
+        if out_amt >= r_out {
+            return u64::MAX; // out of range; caller's responsibility to guard
+        }
+        let num = out_amt * r_in * mult;
+        let den = (r_out - out_amt) * modifier;
+        ((num / den) + 1) as u64
     }
-    fn price_impact_percent(&self, _pool: &LiquidityPool, _in_token: &Token, _in_amount: u64) -> f64 {
-        unimplemented!("Task 12")
+    fn price_impact_percent(&self, pool: &LiquidityPool, in_token: &Token, in_amount: u64) -> f64 {
+        let (mult, modifier) = fee_mods(pool.pool_fee_percent);
+        let (r_in, r_out) = corresponding_reserves(pool, in_token);
+        // Use f64 throughout to avoid u128 overflow on large reserve × amount products.
+        let in_amt = in_amount as f64;
+        let r_in_f = r_in as f64;
+        let r_out_f = r_out as f64;
+        let mult_f = mult as f64;
+        let mod_f = modifier as f64;
+        let out_num = in_amt * mod_f * r_out_f;
+        let out_den = in_amt * mod_f + r_in_f * mult_f;
+        let pi_num = r_out_f * in_amt * out_den * mod_f - out_num * r_in_f * mult_f;
+        let pi_den = r_out_f * in_amt * out_den * mult_f;
+        pi_num * 100.0 / pi_den
     }
     fn swap_order_fees(&self) -> Vec<SwapFee> {
         vec![
@@ -62,5 +105,68 @@ impl DexSwap for MinswapV2 {
     }
     fn build_cancel_order(&self, _order_utxos: &[Utxo], _return_address: &str) -> Result<Vec<PayToAddress>> {
         Err(anyhow!("Task 15"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Asset, LiquidityPool, Token};
+
+    fn ada_token_pool(reserve_ada: u64, reserve_token: u64, fee_pct: f64) -> LiquidityPool {
+        LiquidityPool {
+            dex_identifier: "MinswapV2".into(),
+            asset_a: Token::Lovelace,
+            asset_b: Token::Asset(Asset::new(
+                "f13ac4d66b3ee19a6aa0f2a22298737bd907cc9512166f2fc971b527",
+                "535452494b45", 0,
+            )),
+            reserve_a: reserve_ada,
+            reserve_b: reserve_token,
+            address: "addr1...".into(),
+            pool_id: format!("{}{}", "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c",
+                                     "7dd6988c5a86693c76aeec1ea94afa41770be0de21a775ca7a2a1eabdb6a0171"),
+            pool_fee_percent: fee_pct,
+            total_lp_tokens: 0,
+        }
+    }
+
+    fn dex() -> MinswapV2 {
+        MinswapV2::new(crate::KupoApi::new("http://localhost:1442"))
+    }
+
+    /// estimated_receive: ada→token swap.
+    ///   formula: (in * fee_mod * out_reserve) / (in * fee_mod + in_reserve * fee_mult)
+    ///   reserveA = 1_000_000_000_000  (1M ADA in lovelace)
+    ///   reserveB = 5_000_000_000_000 (token)
+    ///   in = 100_000_000 (100 ADA); fee 0.3% → fee_mod = 9970
+    ///   numerator   = 100_000_000 * 9970 * 5_000_000_000_000 = 4_985_000_000_000_000_000_000_000
+    ///   denominator = 100_000_000 * 9970 + 1_000_000_000_000 * 10000 = 10_000_997_000_000_000
+    ///   = 498_450_304
+    #[test]
+    fn estimated_receive_constant_product_with_fee() {
+        let pool = ada_token_pool(1_000_000_000_000, 5_000_000_000_000, 0.3);
+        let got = dex().estimated_receive(&pool, &Token::Lovelace, 100_000_000);
+        assert_eq!(got, 498_450_304);
+    }
+
+    /// estimated_give: inverse — to receive `out` of B, how much A in?
+    ///   formula: (out * in_reserve * fee_mult) / ((out_reserve - out) * fee_mod) + 1
+    ///   Choosing out = 498_450_304 (the round-trip from above) should return 100_000_000.
+    #[test]
+    fn estimated_give_round_trip() {
+        let pool = ada_token_pool(1_000_000_000_000, 5_000_000_000_000, 0.3);
+        let out = 498_450_304u64;
+        let got = dex().estimated_give(&pool, &Token::Asset(match &pool.asset_b {
+            Token::Asset(a) => a.clone(), _ => unreachable!(),
+        }), out);
+        assert_eq!(got, 100_000_000);
+    }
+
+    #[test]
+    fn price_impact_is_positive_for_nontrivial_trade() {
+        let pool = ada_token_pool(1_000_000_000_000, 5_000_000_000_000, 0.3);
+        let pi = dex().price_impact_percent(&pool, &Token::Lovelace, 100_000_000);
+        assert!(pi > 0.0 && pi < 1.0, "price impact = {}", pi);
     }
 }
