@@ -20,8 +20,8 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust
-//! use dexter_kupo_rs::{KupoApi, dex::{MinswapV2, BaseDex}};
+//! ```no_run
+//! use dexter_kupo_rs::{KupoApi, dex::{minswap_v2::MinswapV2, BaseDex}};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,6 +69,25 @@
 //! # Query VyFi Bar rate
 //! cargo run --release -- --vyfi-bar <pool_identifier>
 //! ```
+//!
+//! ## Building a Minswap V2 limit order
+//!
+//! ```no_run
+//! use dexter_kupo_rs::{KupoApi, SwapRequest, Token};
+//! use dexter_kupo_rs::dex::minswap_v2::MinswapV2;
+//!
+//! # async fn doc(pool: dexter_kupo_rs::LiquidityPool) -> anyhow::Result<()> {
+//! let dex = MinswapV2::new(KupoApi::new("http://localhost:1442"));
+//! let pays = SwapRequest::new(&dex)
+//!     .for_pool(pool)
+//!     .with_swap_in_token(Token::Lovelace)
+//!     .with_swap_in_amount(2_000_000_000)
+//!     .with_minimum_receive(341_880_341)
+//!     .with_sender_address("addr1...")?
+//!     .build()?;
+//! // Hand `pays` to your tx-building layer (Phase 2).
+//! # Ok(()) }
+//! ```
 
 pub mod address;
 pub mod cache;
@@ -79,11 +98,13 @@ pub mod plutus;
 pub mod requests;
 pub mod utils;
 
+pub use address::{decode_base_address, script_and_stake_to_base_address, WalletAddress};
 pub use cache::{load_from_file, save_to_file};
-pub use dex::BaseDex;
+pub use dex::{BaseDex, DexSwap};
 pub use dex::vyfinance::{VyFinanceCache, VyFinancePoolData};
 pub use kupo::KupoApi;
 pub use models::{Asset, LiquidityPool, Order, OrderBook, StablePool, Token, Utxo};
+pub use plutus::PlutusData;
 pub use requests::{
     AddressType, AssetAmount, CancelSwapRequest, OrderKind, PayToAddress, PlutusScript,
     PlutusVersion, SpendUtxo, SwapFee, SwapParams, SwapRequest,
