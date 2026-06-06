@@ -14,6 +14,8 @@ pub mod cswap;
 pub mod chadswap;
 pub mod vyfinance;
 pub mod vyfi_bar;
+pub mod swap;
+pub use swap::DexSwap;
 
 #[async_trait]
 pub trait BaseDex: Send + Sync {
