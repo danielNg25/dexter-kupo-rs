@@ -5,6 +5,10 @@
 //!   cargo run --example live_swap                # dry-run (build+sign, print, no submit)
 //!   cargo run --example live_swap -- --submit    # actually broadcast
 //!
+//! Env vars can be set via standard `export FOO=bar` in your shell, OR by
+//! creating a `.env` file in the working directory with `FOO=bar` lines.
+//! (`.env` is already in `.gitignore` — your mnemonics stay out of commits.)
+//!
 //! REQUIRED ENV VARS:
 //!   KUPO_URL               local Kupo API URL (http://localhost:1442)
 //!   BLOCKFROST_PROJECT_ID  mainnet Blockfrost project ID (mainnet...)
@@ -66,6 +70,10 @@ const HARDENED: u32 = 0x8000_0000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Auto-load .env from the current working directory if present. Silently ignored
+    // if no .env file exists — the example still works with pure shell `export` vars.
+    let _ = dotenvy::dotenv();
+
     let args: Vec<String> = env::args().collect();
     let submit = args.iter().any(|a| a == "--submit");
 

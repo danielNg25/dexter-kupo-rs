@@ -33,6 +33,7 @@ default = []
 export = []
 
 [dev-dependencies]
+dotenvy = "0.15"
 pallas-primitives = "1.0"
 pallas-codec = "1.0"
 pallas-crypto = "1.0"
