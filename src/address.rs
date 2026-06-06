@@ -3,7 +3,8 @@
 //! Cardano Shelley address layout (header byte | payload):
 //!   * type 0 (base, key payment + key stake)    header = 0x01 (net 1 = mainnet)
 //!   * type 1 (base, script payment + key stake) header = 0x11
-//! Payload of a base address = payment_credential(28) || stake_credential(28).
+//!
+//!   Payload of a base address = payment_credential(28) || stake_credential(28).
 
 use anyhow::{anyhow, Result};
 
@@ -56,7 +57,7 @@ pub fn decode_base_address(addr: &str) -> Result<WalletAddress> {
 
 /// Build a mainnet base address (header 0x11) from a script payment credential
 /// + a key staking credential. Matches dexter's `lucidUtils.credentialToAddress(...)`
-/// for the per-user V2 order address.
+///   for the per-user V2 order address.
 pub fn script_and_stake_to_base_address(
     script_hash_hex: &str,
     stake_key_hash_hex: &str,

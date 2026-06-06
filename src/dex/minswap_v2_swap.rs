@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn build_cancel_order_picks_the_order_utxo_and_emits_redeemer() {
         use crate::models::Utxo;
-        use crate::dex::minswap_v2_swap::{ORDER_SCRIPT_HASH, CANCEL_REDEEMER, ORDER_SCRIPT_CBOR_HEX};
+        use crate::dex::minswap_v2_swap::{CANCEL_REDEEMER, ORDER_SCRIPT_CBOR_HEX};
         use crate::requests::PlutusVersion;
 
         // Two UTxOs — one at the order script address, one at an unrelated base address.
