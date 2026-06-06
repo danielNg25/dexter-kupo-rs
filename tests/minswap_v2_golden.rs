@@ -82,3 +82,68 @@ fn v2_order_datum_matches_onchain_golden() {
     let got = datum.to_cbor_hex().expect("encode failed");
     assert_eq!(got, GOLDEN_DATUM_HEX, "datum CBOR diverges from on-chain golden");
 }
+
+use dexter_kupo_rs::address::decode_base_address;
+use dexter_kupo_rs::dex::minswap_v2::MinswapV2;
+use dexter_kupo_rs::dex::DexSwap;
+use dexter_kupo_rs::models::{Asset, LiquidityPool, Token};
+use dexter_kupo_rs::{KupoApi, OrderKind, SwapParams};
+
+// Sender address whose payment key hash is e6f174... (matches the golden datum PKH)
+// and whose stake key hash is 43f425... (same stake as used for the order address derivation).
+const SENDER_ADDR: &str = "addr1q8n0za95gc5qvjlacckd72lx83gt9ntgvf00u6z87h7mlq6r7sjjnw3fd7elhw73fqtcjae3yxd9xwwn2x265mnadv3q7pn7ep";
+const ORDER_ADDR:  &str = "addr1z8p79rpkcdz8x9d6tft0x0dx5mwuzac2sa4gm8cvkw5hcnzr7sjjnw3fd7elhw73fqtcjae3yxd9xwwn2x265mnadv3qhj56am";
+
+#[test]
+fn build_swap_order_reproduces_onchain_golden() {
+    // Sender's full address from the golden tx.
+    let sender   = decode_base_address(SENDER_ADDR).unwrap();
+    let receiver = sender.clone();
+
+    // Pool: ADA / SOME_TOKEN (B unit hex used here is arbitrary — irrelevant
+    // to the datum; only the LP token name in pool_id matters for the datum,
+    // plus the direction calculation, which depends on the token unit
+    // (ADA "" < any hex), so any non-empty token unit reproduces direction=1).
+    let pool = LiquidityPool {
+        dex_identifier: "MinswapV2".into(),
+        asset_a: Token::Lovelace,
+        asset_b: Token::Asset(Asset::new(
+            "1111111111111111111111111111111111111111111111111111111c",
+            "deadbeef", 0,
+        )),
+        reserve_a: 100_000_000_000_000,
+        reserve_b: 100_000_000_000_000,
+        address: "addr1...".into(),
+        // pool_id = LP_TOKEN_POLICY || LP_TOKEN_NAME (matches the V2 reader's behaviour)
+        pool_id: format!("{}{}", LP_TOKEN_POLICY, LP_TOKEN_NAME),
+        pool_fee_percent: 0.3,
+        total_lp_tokens: 0,
+    };
+
+    let params = SwapParams {
+        sender,
+        receiver,
+        swap_in_token: Token::Lovelace,
+        swap_out_token: pool.asset_b.clone(),
+        swap_in_amount: SWAP_IN_AMOUNT as u64,
+        min_receive: MIN_RECEIVE as u64,
+        kind: OrderKind::Limit,
+        kill_on_failed: false,
+        spend_utxos: vec![],
+    };
+
+    let dex = MinswapV2::new(KupoApi::new("http://localhost:1442"));
+    let pays = dex.build_swap_order(&pool, &params).expect("build failed");
+    assert_eq!(pays.len(), 1);
+
+    let p = &pays[0];
+    assert_eq!(p.address, ORDER_ADDR);
+    assert_eq!(p.is_inline_datum, false);
+    assert_eq!(p.datum.as_deref(), Some(GOLDEN_DATUM_HEX),
+               "datum CBOR diverges from on-chain golden");
+
+    // One lovelace amount = swap_in (2000 ADA) + batcher (2) + deposit (2)
+    assert_eq!(p.assets.len(), 1, "ADA-in swap should have a single lovelace amount");
+    assert_eq!(p.assets[0].unit, "lovelace");
+    assert_eq!(p.assets[0].quantity, 2_000_000_000 + 2_000_000 + 2_000_000);
+}

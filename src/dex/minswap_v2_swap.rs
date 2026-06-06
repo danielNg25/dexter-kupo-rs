@@ -5,10 +5,12 @@
 
 use anyhow::{anyhow, Result};
 
+use crate::address::{script_and_stake_to_base_address, WalletAddress};
 use crate::dex::minswap_v2::MinswapV2;
 use crate::dex::DexSwap;
 use crate::models::{token_identifier, LiquidityPool, Token, Utxo};
-use crate::requests::{PayToAddress, SwapFee, SwapParams};
+use crate::plutus::PlutusData;
+use crate::requests::{AddressType, AssetAmount, PayToAddress, SwapFee, SwapParams};
 
 /// Returns `(reserve_for_token, reserve_for_other)` ordered to match `token`.
 fn corresponding_reserves(pool: &LiquidityPool, token: &Token) -> (u128, u128) {
@@ -42,6 +44,95 @@ pub const ORDER_SCRIPT_CBOR_HEX: &str = "590a60010000333232323232323232322222253
 
 pub const BATCHER_FEE_LOVELACE: u64 = 2_000_000;
 pub const DEPOSIT_LOVELACE: u64 = 2_000_000;
+
+/// Convert a Token into the two byte vectors used in datum fields:
+///   * lovelace → (empty, empty)
+///   * Asset    → (policy_id bytes, name_hex bytes)
+#[allow(dead_code)]
+fn token_to_datum_bytes(t: &Token) -> Result<(Vec<u8>, Vec<u8>)> {
+    match t {
+        Token::Lovelace => Ok((vec![], vec![])),
+        Token::Asset(a) => {
+            let policy = hex::decode(&a.policy_id)
+                .map_err(|e| anyhow!("token policy_id hex: {}", e))?;
+            let name = hex::decode(&a.name_hex)
+                .map_err(|e| anyhow!("token name_hex hex: {}", e))?;
+            Ok((policy, name))
+        }
+    }
+}
+
+/// Compute the V2 swap direction (`a_to_b_direction` in the Minswap spec, 0/1).
+///   * Matches dexter: lexicographic compare of swap-in vs swap-out unit strings.
+///   * "lovelace" is represented by the empty unit ("" + ""), which sorts first.
+fn compute_direction(swap_in: &Token, swap_out: &Token) -> u64 {
+    fn unit_for_sort(t: &Token) -> String {
+        match t {
+            Token::Lovelace => String::new(),
+            Token::Asset(a) => format!("{}{}", a.policy_id, a.name_hex),
+        }
+    }
+    let in_u = unit_for_sort(swap_in);
+    let out_u = unit_for_sort(swap_out);
+    if in_u <= out_u { 1 } else { 0 }
+}
+
+/// Build the 9-field V2 OrderDatum.
+fn build_v2_order_datum(
+    sender_pkh_hex: &str,
+    receiver: &WalletAddress,
+    lp_policy_hex: &str,
+    lp_name_hex: &str,
+    direction: u64,
+    swap_in_amount: u64,
+    min_receive: u64,
+    killable: bool,
+    batcher_fee: u64,
+) -> Result<PlutusData> {
+    let stake_hex = receiver.staking_key_hash.as_deref().ok_or_else(|| {
+        anyhow!("receiver address has no staking credential (required for V2 order)")
+    })?;
+    let r_pkh_hex = receiver.payment_key_hash.as_str();
+
+    let canceller_pkh = PlutusData::bytes_hex(sender_pkh_hex)?;
+    let r_pkh = PlutusData::bytes_hex(r_pkh_hex)?;
+    let r_stake = PlutusData::bytes_hex(stake_hex)?;
+
+    let wallet_address = PlutusData::Constr(0, vec![
+        PlutusData::Constr(0, vec![r_pkh.clone()]),
+        PlutusData::Constr(0, vec![
+            PlutusData::Constr(0, vec![
+                PlutusData::Constr(0, vec![r_stake.clone()]),
+            ]),
+        ]),
+    ]);
+
+    let lp_policy = PlutusData::bytes_hex(lp_policy_hex)?;
+    let lp_name = PlutusData::bytes_hex(lp_name_hex)?;
+
+    let killable_constr = if killable {
+        PlutusData::Constr(1, vec![])
+    } else {
+        PlutusData::Constr(0, vec![])
+    };
+
+    Ok(PlutusData::Constr(0, vec![
+        PlutusData::Constr(0, vec![canceller_pkh]),
+        wallet_address.clone(),
+        PlutusData::Constr(0, vec![]),
+        wallet_address,
+        PlutusData::Constr(0, vec![]),
+        PlutusData::Constr(0, vec![lp_policy, lp_name]),
+        PlutusData::Constr(0, vec![
+            PlutusData::Constr(direction, vec![]),
+            PlutusData::Constr(0, vec![PlutusData::Int(swap_in_amount as i128)]),
+            PlutusData::Int(min_receive as i128),
+            killable_constr,
+        ]),
+        PlutusData::Int(batcher_fee as i128),
+        PlutusData::Constr(1, vec![]),
+    ]))
+}
 
 impl DexSwap for MinswapV2 {
     fn identifier(&self) -> &str {
@@ -100,8 +191,71 @@ impl DexSwap for MinswapV2 {
             },
         ]
     }
-    fn build_swap_order(&self, _pool: &LiquidityPool, _params: &SwapParams) -> Result<Vec<PayToAddress>> {
-        Err(anyhow!("Task 14"))
+    fn build_swap_order(&self, pool: &LiquidityPool, params: &SwapParams) -> Result<Vec<PayToAddress>> {
+        if params.swap_in_amount == 0 {
+            return Err(anyhow!("swap_in_amount must be > 0"));
+        }
+        // Validate that swap_in_token is one of the pool's assets.
+        let in_id = token_identifier(&params.swap_in_token);
+        let a_id = token_identifier(&pool.asset_a);
+        let b_id = token_identifier(&pool.asset_b);
+        if in_id != a_id && in_id != b_id {
+            return Err(anyhow!("swap_in_token is not in this pool"));
+        }
+
+        // LP token name = the portion of pool_id AFTER the 56-char LP policy prefix.
+        if pool.pool_id.len() < 56 || !pool.pool_id.starts_with(LP_TOKEN_POLICY_ID) {
+            return Err(anyhow!(
+                "pool.pool_id must start with the V2 LP policy ({}) — got `{}`",
+                LP_TOKEN_POLICY_ID, pool.pool_id
+            ));
+        }
+        let lp_name_hex = &pool.pool_id[56..];
+
+        let direction = compute_direction(&params.swap_in_token, &params.swap_out_token);
+
+        let datum = build_v2_order_datum(
+            &params.sender.payment_key_hash,
+            &params.receiver,
+            LP_TOKEN_POLICY_ID,
+            lp_name_hex,
+            direction,
+            params.swap_in_amount,
+            params.min_receive,
+            params.kill_on_failed,
+            BATCHER_FEE_LOVELACE,
+        )?;
+
+        let order_address = script_and_stake_to_base_address(
+            ORDER_SCRIPT_HASH,
+            params.sender.staking_key_hash.as_deref().ok_or_else(|| {
+                anyhow!("sender address has no staking credential (required for V2 order)")
+            })?,
+        )?;
+
+        // Output lovelace = batcher + deposit + (swap-in if it's ADA).
+        let mut lovelace = BATCHER_FEE_LOVELACE + DEPOSIT_LOVELACE;
+        let mut assets: Vec<AssetAmount> = Vec::new();
+        match &params.swap_in_token {
+            Token::Lovelace => lovelace += params.swap_in_amount,
+            Token::Asset(a) => {
+                assets.push(AssetAmount {
+                    unit: format!("{}{}", a.policy_id, a.name_hex),
+                    quantity: params.swap_in_amount,
+                });
+            }
+        }
+        let mut all_assets = vec![AssetAmount { unit: "lovelace".into(), quantity: lovelace }];
+        all_assets.append(&mut assets);
+
+        Ok(vec![PayToAddress {
+            address: order_address,
+            address_type: AddressType::Contract,
+            assets: all_assets,
+            datum: Some(datum.to_cbor_hex()?),
+            is_inline_datum: false,
+            spend_utxos: vec![],
+        }])
     }
     fn build_cancel_order(&self, _order_utxos: &[Utxo], _return_address: &str) -> Result<Vec<PayToAddress>> {
         Err(anyhow!("Task 15"))
