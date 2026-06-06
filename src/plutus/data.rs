@@ -61,7 +61,7 @@ impl PlutusData {
                 }
                 Ok(())
             }
-            PlutusData::List(_)      => unimplemented!("List in Task 4"),
+            PlutusData::List(items) => write_fields(items, out),
         }
     }
 }
@@ -204,5 +204,14 @@ mod tests {
     fn constr_index_above_127_uses_tag_102() {
         // d8 66 = tag(102); 82 = array(2); 18 80 = Int(128); 80 = array(0)
         assert_eq!(cbor(PlutusData::Constr(128, vec![])), "d86682188080");
+    }
+
+    #[test]
+    fn list_empty_and_nonempty() {
+        assert_eq!(cbor(PlutusData::List(vec![])), "80");
+        assert_eq!(
+            cbor(PlutusData::List(vec![PlutusData::Int(1), PlutusData::Int(2)])),
+            "9f0102ff"
+        );
     }
 }
