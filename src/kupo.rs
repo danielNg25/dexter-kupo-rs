@@ -155,20 +155,44 @@ impl KupoApi {
 
     /// Fetch the most recent checkpoint slot from Kupo's /health endpoint.
     /// Used to derive a TTL for transactions ("invalid_from_slot").
+    ///
+    /// Reads the `X-Most-Recent-Checkpoint` response header (always present
+    /// regardless of Accept negotiation). Falls back to JSON body parsing if the
+    /// header is missing.
     pub async fn tip_slot(&self) -> Result<u64> {
         let url = format!("{}/health", self.api_url);
-        let response = self.client.get(&url).send().await?;
+        let response = self
+            .client
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(anyhow::anyhow!("rate_limited"));
         }
+
+        // Primary: read the X-Most-Recent-Checkpoint header.
+        if let Some(hv) = response.headers().get("x-most-recent-checkpoint") {
+            if let Ok(s) = hv.to_str() {
+                if let Ok(n) = s.trim().parse::<u64>() {
+                    return Ok(n);
+                }
+            }
+        }
+
+        // Fallback: parse the body as JSON.
         let body = response.text().await?;
-        let v: serde_json::Value = serde_json::from_str(&body)?;
-        // Try top-level number first
+        let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            anyhow::anyhow!(
+                "Kupo /health body is not JSON and X-Most-Recent-Checkpoint header was missing/invalid: {}",
+                e
+            )
+        })?;
         if let Some(n) = v.get("most_recent_checkpoint").and_then(|x| x.as_u64()) {
             return Ok(n);
         }
-        // Fall back to nested .slot_no
-        if let Some(n) = v.get("most_recent_checkpoint")
+        if let Some(n) = v
+            .get("most_recent_checkpoint")
             .and_then(|x| x.get("slot_no"))
             .and_then(|x| x.as_u64())
         {
