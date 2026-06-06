@@ -210,7 +210,7 @@ async fn main() -> Result<()> {
     let approx_signed_size = built_first.tx_bytes.0.len() as u64 + 100;
     let refined_fee = min_fee_b + min_fee_a * approx_signed_size;
     // Clamp to sane bounds; Cardano linear fee for a small tx is typically 170k–220k.
-    fee_estimate = refined_fee.max(170_000).min(600_000);
+    fee_estimate = refined_fee.max(170_000).min(500_000);
     eprintln!(
         "fee estimate: {} lovelace (tx ~{} bytes)",
         fee_estimate, approx_signed_size
@@ -471,9 +471,27 @@ impl Config {
             bail!("missing required env vars: {:?}", missing);
         }
 
+        let bf_project_id = env::var("BLOCKFROST_PROJECT_ID").unwrap();
+        let sender_bech32 = env::var("SENDER_BECH32").unwrap();
+
+        // Early-fail on wrong-network env values.
+        if !sender_bech32.starts_with("addr1") {
+            bail!(
+                "SENDER_BECH32 must be a mainnet base address starting with `addr1` — got `{}` (testnet/preview addresses are not supported)",
+                sender_bech32
+            );
+        }
+
+        if !bf_project_id.starts_with("mainnet") {
+            bail!(
+                "BLOCKFROST_PROJECT_ID must be a mainnet project id (starting with `mainnet`) — got a `{}...` prefix",
+                bf_project_id.chars().take(7).collect::<String>()
+            );
+        }
+
         Ok(Self {
-            bf_project_id: env::var("BLOCKFROST_PROJECT_ID").unwrap(),
-            sender_bech32: env::var("SENDER_BECH32").unwrap(),
+            bf_project_id,
+            sender_bech32,
             sender_private_key: env::var("SENDER_PRIVATE_KEY").unwrap(),
             pool_lp_token_unit: env::var("POOL_LP_TOKEN_UNIT").unwrap(),
             pool_reserve_a: env::var("POOL_RESERVE_A")
