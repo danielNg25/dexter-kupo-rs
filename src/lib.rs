@@ -70,6 +70,7 @@
 //! cargo run --release -- --vyfi-bar <pool_identifier>
 //! ```
 
+pub mod address;
 pub mod cache;
 pub mod dex;
 pub mod kupo;
