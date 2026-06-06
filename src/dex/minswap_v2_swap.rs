@@ -45,23 +45,6 @@ pub const ORDER_SCRIPT_CBOR_HEX: &str = "590a60010000333232323232323232322222253
 pub const BATCHER_FEE_LOVELACE: u64 = 2_000_000;
 pub const DEPOSIT_LOVELACE: u64 = 2_000_000;
 
-/// Convert a Token into the two byte vectors used in datum fields:
-///   * lovelace → (empty, empty)
-///   * Asset    → (policy_id bytes, name_hex bytes)
-#[allow(dead_code)]
-fn token_to_datum_bytes(t: &Token) -> Result<(Vec<u8>, Vec<u8>)> {
-    match t {
-        Token::Lovelace => Ok((vec![], vec![])),
-        Token::Asset(a) => {
-            let policy = hex::decode(&a.policy_id)
-                .map_err(|e| anyhow!("token policy_id hex: {}", e))?;
-            let name = hex::decode(&a.name_hex)
-                .map_err(|e| anyhow!("token name_hex hex: {}", e))?;
-            Ok((policy, name))
-        }
-    }
-}
-
 /// Compute the V2 swap direction (`a_to_b_direction` in the Minswap spec, 0/1).
 ///   * Matches dexter: lexicographic compare of swap-in vs swap-out unit strings.
 ///   * "lovelace" is represented by the empty unit ("" + ""), which sorts first.
