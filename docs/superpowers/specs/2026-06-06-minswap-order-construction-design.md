@@ -28,7 +28,7 @@ On-chain reality (confirmed): a **limit order is the same `SwapExactIn` step** w
 
 ### Goals (Phase 1)
 1. Build **Minswap V2** swap orders (`SwapExactIn`) → datum CBOR + payment instructions.
-2. Build **limit orders** (same `SwapExactIn` datum, user-chosen price).
+2. Build **limit orders** (same `SwapExactIn` datum; the caller supplies the raw `minimum_receive`).
 3. Build **cancel** instructions for V2 resting orders (redeemer + order script witness).
 4. Provide the **AMM math** (`estimated_receive` / `estimated_give` / `price_impact_percent` / `minimum_receive`).
 5. Output the **same boundary object dexter produces** (`PayToAddress`), so a future tx layer can consume it unchanged.
@@ -40,6 +40,7 @@ On-chain reality (confirmed): a **limit order is the same `SwapExactIn` step** w
 - Stop-Loss, OCO, SwapExactOut, zap/deposit/withdraw order types.
 - Testnet/preview networks (**mainnet only**).
 - DEXs other than Minswap V2.
+- Token-decimals / price→`min_receive` conversion and any metadata/registry lookups — the outer project converts human price to a raw `min_receive` and passes it in.
 
 ### Output boundary (decided)
 The library's responsibility ends at **order instructions**: it returns a `Vec<PayToAddress>` describing what to pay, where, with which datum (or, for cancel, which UTxO to spend with which redeemer/validator). The consuming project turns that into a transaction. This mirrors exactly where dexter draws the line between its DEX classes and the Lucid wallet provider.
@@ -166,7 +167,7 @@ pub struct SwapParams {
     pub swap_in_token: Token,
     pub swap_out_token: Token,
     pub swap_in_amount: u64,
-    pub min_receive: u64,          // resolved (slippage | limit price | explicit)
+    pub min_receive: u64,          // resolved: slippage-derived (market) OR caller-supplied raw (limit)
     pub kind: OrderKind,
     pub kill_on_failed: bool,      // default false (resting); true = fill-or-kill market
     pub spend_utxos: Vec<Utxo>,
@@ -182,19 +183,18 @@ let pays: Vec<PayToAddress> = SwapRequest::new(&dex)        // &MinswapV2
     .with_swap_in_amount(amount_raw)
     .with_sender_address("addr1...")?                       // mainnet base addr; receiver defaults to sender
     // exactly one pricing mode (last write wins, like dexter):
-    .with_slippage_percent(1.0)                             // Market
-    .with_limit_price(0.5)                                  // Limit (decimal-aware)
-    .with_minimum_receive(1_234_567)                        // Limit (explicit raw)
+    .with_slippage_percent(1.0)                             // Market: derive min_receive from current price
+    .with_minimum_receive(1_234_567)                        // Limit:  caller-supplied raw min_receive
     .build()?;
 ```
 
 Read-only helpers mirror dexter: `get_estimated_receive()`, `get_minimum_receive()`, `get_price_impact_percent()`, `get_swap_fees()`. No `.submit()` (Phase 2).
 
-**Pricing resolution:**
-- **Market** (`with_slippage_percent`): `min_receive = floor(estimated_receive(pool, in, amount) / (1 + slippage/100))`.
-- **Limit by price** (`with_limit_price`): decimal-aware
-  `min_receive = floor(swap_in_amount × price × 10^(out_decimals − in_decimals))`, reading `decimals` off the pool tokens (ADA = 6). `f64` acceptable — `min_receive` is a user threshold, not a consensus value. **Errors** if a token's `decimals` is unknown (see §8).
-- **Limit by explicit amount** (`with_minimum_receive`): used verbatim.
+**Pricing resolution — the library only ever deals in the raw integer `min_receive`:**
+- **Market** (`with_slippage_percent`): `min_receive = floor(estimated_receive(pool, in, amount) / (1 + slippage/100))` — pure integer arithmetic on pool reserves; no decimals.
+- **Limit** (`with_minimum_receive`): the caller-supplied raw value is used verbatim.
+
+Human-readable price → raw `min_receive` conversion (and any token-decimals lookup) is the **outer project's responsibility**, not the library's: decimals/price are presentation concerns that don't affect on-chain correctness. The library needs **no token decimals** and makes **no metadata/registry calls**.
 
 `kill_on_failed` defaults to `false` (resting), matching dexter and the verified on-chain order; an optional setter exposes fill-or-kill market behavior.
 
@@ -288,12 +288,12 @@ Capture additional market-swap datums from `dexter` (TS) — token→ADA and tok
 - AMM math (`estimated_receive/give`, `price_impact`) vs dexter outputs across several reserve/amount cases.
 - `PlutusData::to_cbor_hex` tag rules (indices 0,1,6,7,127,128) and primitives.
 - `decode_base_address` + `script_and_stake_to_base_address` against the verified addresses in §7.1 (order `addr1z8p79rpk…`, sender `addr1qyfd4vf3…`).
-- `with_limit_price` decimal math (in/out decimal combinations; ADA = 6).
+- `min_receive` from slippage: `floor(estimated_receive / (1 + slippage/100))` across a few slippage values.
 
 ---
 
 ## 8. Error handling
-All fallible builders return `anyhow::Result` (crate convention). Explicit, non-panicking errors for: input token not in pool; `with_limit_price` used when a token's `decimals` is unknown; swap-in amount == 0; address that fails to decode / is not a mainnet base address / lacks a staking credential; `estimated_give` exceeding the out-reserve. No panics in library code.
+All fallible builders return `anyhow::Result` (crate convention). Explicit, non-panicking errors for: input token not in pool; no pricing mode set (`min_receive` unresolved); swap-in amount == 0; address that fails to decode / is not a mainnet base address / lacks a staking credential; `estimated_give` exceeding the out-reserve. No panics in library code.
 
 ---
 
@@ -313,5 +313,5 @@ Because `build()` returns `Vec<PayToAddress>` — the same shape dexter hands to
 | `max_batcher_fee = 2_000000`; output lovelace = swap-in + 4 ADA | ✅ Verified |
 | Datum is a hash output (not inline) | ✅ Verified |
 | `direction` lexicographic rule (ADA-in → 1) | ✅ Verified |
-| Token `decimals` available when `with_limit_price` is used | ⚠️ Open — guarded by an explicit error (§8); confirm read path populates decimals, else require caller-supplied decimals |
+| Token decimals / price handling | ✅ Resolved — out of scope; outer project converts price→raw `min_receive`, library is decimals-free |
 | `PlutusData::to_cbor_hex` reproduces indefinite-array byte form | ⚠️ Implementation detail — pinned by the §7.1 golden test |
