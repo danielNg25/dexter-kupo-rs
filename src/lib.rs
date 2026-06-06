@@ -76,6 +76,7 @@ pub mod dex;
 pub mod kupo;
 pub mod models;
 pub mod plutus;
+pub mod requests;
 pub mod utils;
 
 pub use cache::{load_from_file, save_to_file};
@@ -83,3 +84,7 @@ pub use dex::BaseDex;
 pub use dex::vyfinance::{VyFinanceCache, VyFinancePoolData};
 pub use kupo::KupoApi;
 pub use models::{Asset, LiquidityPool, Order, OrderBook, StablePool, Token, Utxo};
+pub use requests::{
+    AddressType, AssetAmount, CancelSwapRequest, OrderKind, PayToAddress, PlutusScript,
+    PlutusVersion, SpendUtxo, SwapFee, SwapParams, SwapRequest,
+};
