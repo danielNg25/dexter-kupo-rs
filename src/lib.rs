@@ -74,6 +74,7 @@ pub mod cache;
 pub mod dex;
 pub mod kupo;
 pub mod models;
+pub mod plutus;
 pub mod utils;
 
 pub use cache::{load_from_file, save_to_file};
