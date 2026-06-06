@@ -43,7 +43,24 @@ impl PlutusData {
                 out.extend_from_slice(b);
                 Ok(())
             }
-            PlutusData::Constr(_, _) => unimplemented!("Constr in Task 3"),
+            PlutusData::Constr(idx, fields) => {
+                let idx = *idx;
+                if idx <= 6 {
+                    write_tag(121 + idx, out);
+                    write_fields(fields, out)?;
+                } else if idx <= 127 {
+                    write_tag(1280 + (idx - 7), out);
+                    write_fields(fields, out)?;
+                } else {
+                    // tag 102, value = definite array [Int(idx), array_of_fields]
+                    write_tag(102, out);
+                    out.push(0x82); // array of 2
+                    write_int(idx as i128, out)?;
+                    // The inner array_of_fields uses the same indef/def rule as a Constr's fields.
+                    write_fields(fields, out)?;
+                }
+                Ok(())
+            }
             PlutusData::List(_)      => unimplemented!("List in Task 4"),
         }
     }
@@ -80,6 +97,27 @@ fn write_int(i: i128, out: &mut Vec<u8>) -> Result<()> {
         let arg_i128 = -1 - i;
         let n: u64 = arg_i128.try_into().map_err(|_| anyhow!("Int {} too small for CBOR nint", i))?;
         write_head(1, n, out);
+    }
+    Ok(())
+}
+
+/// CBOR tag head (major type 6).
+fn write_tag(tag: u64, out: &mut Vec<u8>) {
+    write_head(6, tag, out);
+}
+
+/// Write a fields array using Lucid's convention:
+///   * empty   → definite-length 0 array `80`
+///   * non-empty → indefinite-length array `9f ... ff`
+fn write_fields(fields: &[PlutusData], out: &mut Vec<u8>) -> Result<()> {
+    if fields.is_empty() {
+        out.push(0x80); // definite array, length 0
+    } else {
+        out.push(0x9f); // indefinite array start
+        for f in fields {
+            f.write_cbor(out)?;
+        }
+        out.push(0xff); // break
     }
     Ok(())
 }
@@ -134,5 +172,37 @@ mod tests {
         let name = hex::decode("7dd6988c5a86693c76aeec1ea94afa41770be0de21a775ca7a2a1eabdb6a0171").unwrap();
         assert_eq!(cbor(PlutusData::Bytes(name)),
             "58207dd6988c5a86693c76aeec1ea94afa41770be0de21a775ca7a2a1eabdb6a0171");
+    }
+
+    #[test]
+    fn constr_empty_uses_definite_empty_array() {
+        // Lucid emits empty fields as `80` (definite empty array), NOT `9fff`.
+        // This matches the on-chain golden (refund_receiver_datum, success_receiver_datum, killable=False).
+        assert_eq!(cbor(PlutusData::Constr(0, vec![])), "d87980"); // tag 121, []
+        assert_eq!(cbor(PlutusData::Constr(1, vec![])), "d87a80"); // tag 122, []
+        assert_eq!(cbor(PlutusData::Constr(6, vec![])), "d87f80"); // tag 127, []
+    }
+
+    #[test]
+    fn constr_nonempty_uses_indefinite_array() {
+        // tag 121 (Constr 0), 1 field, indefinite array: d8 79 9f <field> ff
+        assert_eq!(
+            cbor(PlutusData::Constr(0, vec![PlutusData::Int(0)])),
+            "d8799f00ff"
+        );
+    }
+
+    #[test]
+    fn constr_index_7_to_127_uses_tag_1280_plus_offset() {
+        // index 7 → tag 1280 = 0x0500 → head: d9 05 00
+        assert_eq!(cbor(PlutusData::Constr(7,   vec![])), "d9050080");
+        // index 127 → tag 1280 + (127-7) = 1400 = 0x0578
+        assert_eq!(cbor(PlutusData::Constr(127, vec![])), "d9057880");
+    }
+
+    #[test]
+    fn constr_index_above_127_uses_tag_102() {
+        // d8 66 = tag(102); 82 = array(2); 18 80 = Int(128); 80 = array(0)
+        assert_eq!(cbor(PlutusData::Constr(128, vec![])), "d86682188080");
     }
 }
