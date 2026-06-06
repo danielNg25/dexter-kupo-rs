@@ -11,15 +11,20 @@
 //!   SENDER_BECH32          sender mainnet base address   (addr1...)
 //!   SENDER_PRIVATE_KEY     raw 64-char hex OR path to cardano-cli payment.skey JSON
 //!   POOL_LP_TOKEN_UNIT     V2 pool LP token unit: <lp_policy_56_hex><lp_name_hex>
-//!   POOL_RESERVE_A         pool reserve A (raw u64, lovelace if A=ADA)
-//!   POOL_RESERVE_B         pool reserve B (raw u64)
-//!   POOL_ASSET_A_UNIT      "lovelace" or <policy_hex><name_hex>
-//!   POOL_ASSET_B_UNIT      same format
 //!   SWAP_IN_UNIT           "lovelace" or <policy_hex><name_hex>
 //!   SWAP_IN_AMOUNT         raw u64 amount to swap in
-//!   MIN_RECEIVE            raw u64 minimum receive (limit price)
 //!
-//! NOTE: Kupo must be indexing SENDER_BECH32; start with --match <sender_addr> or a broader pattern.
+//! OPTIONAL ENV VARS:
+//!   LIMIT_PREMIUM_PERCENT  minimum-receive = estimate * (1 + X/100); default 10.0
+//!                          Set to 0 for market order at current price.
+//!                          Set to e.g. 5 to require 5% better-than-current output.
+//!
+//! NOTE: Pool data (assets, reserves, fee) is fetched live from Kupo.
+//!       Kupo must be indexing the Minswap V2 validity asset.
+//!       Start Kupo with at least:
+//!         --match f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c.4d5350
+//!       (or a broader pattern like --match "*")
+//!       AND indexing SENDER_BECH32 for UTxO queries.
 //!
 //! Use a FRESH TEST WALLET funded with only the ADA you intend to spend.
 //! NEVER use your main Eternl wallet's seed phrase or payment key.
@@ -31,9 +36,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use dexter_kupo_rs::{
-    dex::minswap_v2::MinswapV2,
-    models::{Asset, LiquidityPool, Token},
-    KupoApi, SwapRequest,
+    dex::{minswap_v2::MinswapV2, BaseDex},
+    models::{token_identifier, Asset, Token},
+    DexSwap, KupoApi, SwapRequest,
 };
 use pallas_addresses::Address as PallasAddress;
 use pallas_crypto::{
@@ -68,11 +73,57 @@ async fn main() -> Result<()> {
     eprintln!("sender:    {}", cfg.sender_bech32);
     eprintln!("pool:      {}", cfg.pool_lp_token_unit);
     eprintln!("swap in:   {} of {}", cfg.swap_in_amount, cfg.swap_in_unit);
-    eprintln!("min rec:   {}", cfg.min_receive);
+    eprintln!("limit premium: +{}%", cfg.limit_premium_percent);
     eprintln!();
 
-    // 1. Build the order via the library (verified byte-for-byte against on-chain golden).
-    let pays = build_order_via_library(&cfg)?;
+    // 1. Fetch pool from Kupo, derive min_receive, build the order via the library.
+    let kupo = KupoApi::new(&cfg.kupo_url);
+    let dex = MinswapV2::new(kupo);
+
+    let pool = dex.liquidity_pool_from_pool_id(&cfg.pool_lp_token_unit).await
+        .context("fetching pool from Kupo (is Kupo indexing the V2 validity asset?)")?;
+    let pool = pool.ok_or_else(|| anyhow!(
+        "no pool found for LP token unit `{}`. Verify (a) the unit is correct and (b) Kupo is indexing the Minswap V2 validity asset (--match f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c.4d5350 or broader).",
+        cfg.pool_lp_token_unit
+    ))?;
+
+    eprintln!("pool fetched from Kupo:");
+    eprintln!("  assets:    {} / {}", token_unit(&pool.asset_a), token_unit(&pool.asset_b));
+    eprintln!("  reserves:  {} / {}", pool.reserve_a, pool.reserve_b);
+    eprintln!("  fee:       {}%", pool.pool_fee_percent);
+
+    // Validate SWAP_IN_UNIT is one of the pool's assets.
+    let swap_in = token_from_unit(&cfg.swap_in_unit)?;
+    let in_id = token_identifier(&swap_in);
+    let a_id = token_identifier(&pool.asset_a);
+    let b_id = token_identifier(&pool.asset_b);
+    if in_id != a_id && in_id != b_id {
+        bail!(
+            "SWAP_IN_UNIT `{}` is not in the pool. Pool contains: `{}` and `{}`.",
+            cfg.swap_in_unit, a_id, b_id
+        );
+    }
+
+    // Derive min_receive from estimated output + premium.
+    let estimated = dex.estimated_receive(&pool, &swap_in, cfg.swap_in_amount);
+    let multiplier = 1.0 + cfg.limit_premium_percent / 100.0;
+    let min_receive = (estimated as f64 * multiplier).floor() as u64;
+
+    eprintln!();
+    eprintln!("limit order pricing:");
+    eprintln!("  current estimate:     {} raw out", estimated);
+    eprintln!("  limit premium:        +{}%", cfg.limit_premium_percent);
+    eprintln!("  computed min_receive: {}", min_receive);
+    eprintln!("  (order only fills if pool gives at least this much output)");
+    eprintln!();
+
+    let pays = SwapRequest::new(&dex)
+        .for_pool(pool)
+        .with_swap_in_token(swap_in)
+        .with_swap_in_amount(cfg.swap_in_amount)
+        .with_minimum_receive(min_receive)
+        .with_sender_address(&cfg.sender_bech32)?
+        .build()?;
     let p = &pays[0];
     let datum_hex = p
         .datum
@@ -103,7 +154,7 @@ async fn main() -> Result<()> {
     eprintln!();
 
     // 2. Fetch chain state from Blockfrost (params) and Kupo (tip slot, wallet UTxOs).
-    let kupo = dexter_kupo_rs::KupoApi::new(&cfg.kupo_url);
+    let kupo = dex.kupo();
 
     let params = blockfrost_get(&client, &cfg.bf_project_id, "/epochs/latest/parameters")
         .await
@@ -334,37 +385,6 @@ fn build_tx(
         .map_err(|e| anyhow!("build_conway_raw: {:?}", e))
 }
 
-// ---------- library bridge ----------
-
-fn build_order_via_library(cfg: &Config) -> Result<Vec<dexter_kupo_rs::PayToAddress>> {
-    let asset_a = token_from_unit(&cfg.pool_asset_a_unit)?;
-    let asset_b = token_from_unit(&cfg.pool_asset_b_unit)?;
-    let swap_in = token_from_unit(&cfg.swap_in_unit)?;
-
-    let pool = LiquidityPool {
-        dex_identifier: "MinswapV2".into(),
-        asset_a,
-        asset_b,
-        reserve_a: cfg.pool_reserve_a,
-        reserve_b: cfg.pool_reserve_b,
-        address: String::new(),
-        pool_id: cfg.pool_lp_token_unit.clone(),
-        pool_fee_percent: 0.3,
-        total_lp_tokens: 0,
-    };
-
-    // KupoApi endpoint is not used here (we supply reserves directly via env).
-    let dex = MinswapV2::new(KupoApi::new("http://unused-no-queries-made"));
-    let pays = SwapRequest::new(&dex)
-        .for_pool(pool)
-        .with_swap_in_token(swap_in)
-        .with_swap_in_amount(cfg.swap_in_amount)
-        .with_minimum_receive(cfg.min_receive)
-        .with_sender_address(&cfg.sender_bech32)?
-        .build()?;
-    Ok(pays)
-}
-
 // ---------- helpers ----------
 
 fn token_from_unit(unit: &str) -> Result<Token> {
@@ -379,6 +399,13 @@ fn token_from_unit(unit: &str) -> Result<Token> {
     }
     let (policy, name) = unit.split_at(56);
     Ok(Token::Asset(Asset::new(policy, name, 0)))
+}
+
+fn token_unit(t: &Token) -> String {
+    match t {
+        Token::Lovelace => "lovelace".to_string(),
+        Token::Asset(a) => format!("{}{}", a.policy_id, a.name_hex),
+    }
 }
 
 /// Parse an Ed25519 secret key from either:
@@ -433,13 +460,11 @@ struct Config {
     /// Raw env-var value; parsed lazily by `parse_signing_key`.
     sender_private_key: String,
     pool_lp_token_unit: String,
-    pool_reserve_a: u64,
-    pool_reserve_b: u64,
-    pool_asset_a_unit: String,
-    pool_asset_b_unit: String,
     swap_in_unit: String,
     swap_in_amount: u64,
-    min_receive: u64,
+    /// Percentage premium over the current estimated output required to fill.
+    /// Defaults to 10.0 if `LIMIT_PREMIUM_PERCENT` is unset.
+    limit_premium_percent: f64,
 }
 
 impl Config {
@@ -450,13 +475,8 @@ impl Config {
             "SENDER_BECH32",
             "SENDER_PRIVATE_KEY",
             "POOL_LP_TOKEN_UNIT",
-            "POOL_RESERVE_A",
-            "POOL_RESERVE_B",
-            "POOL_ASSET_A_UNIT",
-            "POOL_ASSET_B_UNIT",
             "SWAP_IN_UNIT",
             "SWAP_IN_AMOUNT",
-            "MIN_RECEIVE",
         ];
 
         let missing: Vec<&str> = REQUIRED
@@ -488,31 +508,23 @@ impl Config {
             );
         }
 
+        let limit_premium_percent = env::var("LIMIT_PREMIUM_PERCENT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(10.0);
+
         Ok(Self {
             kupo_url,
             bf_project_id,
             sender_bech32,
             sender_private_key: env::var("SENDER_PRIVATE_KEY").unwrap(),
             pool_lp_token_unit: env::var("POOL_LP_TOKEN_UNIT").unwrap(),
-            pool_reserve_a: env::var("POOL_RESERVE_A")
-                .unwrap()
-                .parse::<u64>()
-                .context("POOL_RESERVE_A must be a u64")?,
-            pool_reserve_b: env::var("POOL_RESERVE_B")
-                .unwrap()
-                .parse::<u64>()
-                .context("POOL_RESERVE_B must be a u64")?,
-            pool_asset_a_unit: env::var("POOL_ASSET_A_UNIT").unwrap(),
-            pool_asset_b_unit: env::var("POOL_ASSET_B_UNIT").unwrap(),
             swap_in_unit: env::var("SWAP_IN_UNIT").unwrap(),
             swap_in_amount: env::var("SWAP_IN_AMOUNT")
                 .unwrap()
                 .parse::<u64>()
                 .context("SWAP_IN_AMOUNT must be a u64")?,
-            min_receive: env::var("MIN_RECEIVE")
-                .unwrap()
-                .parse::<u64>()
-                .context("MIN_RECEIVE must be a u64")?,
+            limit_premium_percent,
         })
     }
 }
