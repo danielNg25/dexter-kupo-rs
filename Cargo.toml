@@ -38,6 +38,10 @@ pallas-codec = "1.0"
 pallas-crypto = "1.0"
 pallas-addresses = "1.0"
 pallas-txbuilder = "1.0"
+bip39 = "2"
+ed25519-bip32 = "0.4"
+pbkdf2 = "0.12"
+sha2 = "0.10"
 
 [[example]]
 name = "live_swap"

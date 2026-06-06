@@ -9,15 +9,22 @@
 //!   KUPO_URL               local Kupo API URL (http://localhost:1442)
 //!   BLOCKFROST_PROJECT_ID  mainnet Blockfrost project ID (mainnet...)
 //!   SENDER_BECH32          sender mainnet base address   (addr1...)
-//!   SENDER_PRIVATE_KEY     raw 64-char hex OR path to cardano-cli payment.skey JSON
+//!   SENDER_MNEMONIC        BIP-39 mnemonic phrase (12, 15, 18, 21, or 24 words)
 //!   POOL_LP_TOKEN_UNIT     V2 pool LP token unit: <lp_policy_56_hex><lp_name_hex>
 //!   SWAP_IN_UNIT           "lovelace" or <policy_hex><name_hex>
 //!   SWAP_IN_AMOUNT         raw u64 amount to swap in
 //!
 //! OPTIONAL ENV VARS:
-//!   LIMIT_PREMIUM_PERCENT  minimum-receive = estimate * (1 + X/100); default 10.0
-//!                          Set to 0 for market order at current price.
-//!                          Set to e.g. 5 to require 5% better-than-current output.
+//!   SENDER_MNEMONIC_PASSPHRASE  spending password / BIP-39 passphrase (default: empty)
+//!   LIMIT_PREMIUM_PERCENT       minimum-receive = estimate * (1 + X/100); default 10.0
+//!                               Set to 0 for market order at current price.
+//!                               Set to e.g. 5 to require 5% better-than-current output.
+//!
+//! The mnemonic is used to derive both payment + stake keys via CIP-1852
+//! (Icarus master key derivation, path m/1852'/1815'/0'/0/0 for payment
+//! and m/1852'/1815'/0'/2/0 for stake). SENDER_BECH32 acts as a sanity
+//! check — if the derived address doesn't match, the example refuses to
+//! do anything.
 //!
 //! NOTE: Pool data (assets, reserves, fee) is fetched live from Kupo.
 //!       Kupo must be indexing the Minswap V2 validity asset.
@@ -27,19 +34,22 @@
 //!       AND indexing SENDER_BECH32 for UTxO queries.
 //!
 //! Use a FRESH TEST WALLET funded with only the ADA you intend to spend.
-//! NEVER use your main Eternl wallet's seed phrase or payment key.
+//! NEVER use your main Eternl wallet's seed phrase.
 //!
 //! # Safety
 //! - Default mode is DRY-RUN: the tx is built and signed but NOT broadcast.
 //! - Pass --submit to actually broadcast. Real ADA will be spent.
-//! - The private key is NEVER logged, printed, or echoed in any error message.
+//! - The mnemonic and passphrase are NEVER logged, printed, or echoed in any
+//!   error message.
 
 use anyhow::{anyhow, bail, Context, Result};
+use bip39::{Language, Mnemonic};
 use dexter_kupo_rs::{
     dex::{minswap_v2::MinswapV2, BaseDex},
     models::{token_identifier, Asset, Token},
     DexSwap, KupoApi, SwapRequest,
 };
+use ed25519_bip32::{DerivationScheme, XPrv};
 use pallas_addresses::Address as PallasAddress;
 use pallas_crypto::{
     hash::{Hash, Hasher},
@@ -51,12 +61,40 @@ use std::env;
 const BLOCKFROST_BASE: &str = "https://cardano-mainnet.blockfrost.io/api/v0";
 const CARDANOSCAN_TX: &str = "https://cardanoscan.io/transaction";
 
+/// Index into the extended-key bytes where kL ends (first 32 bytes = kL).
+const HARDENED: u32 = 0x8000_0000;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let submit = args.iter().any(|a| a == "--submit");
 
     let cfg = Config::from_env().context("loading env vars")?;
+
+    // ── Key derivation — MUST happen before any network call ──────────────────
+    // A wrong mnemonic or passphrase produces a different address; the
+    // SENDER_BECH32 sanity check below refuses to proceed in that case.
+    let (payment_xprv, _stake_xprv, derived_addr) =
+        derive_account_keys(&cfg.sender_mnemonic, &cfg.sender_mnemonic_passphrase)
+            .context("deriving keys from mnemonic")?;
+
+    if derived_addr != cfg.sender_bech32 {
+        bail!(
+            "MNEMONIC DOES NOT MATCH SENDER_BECH32.\n  derived:  {}\n  expected: {}\n  Refusing to proceed (wrong wallet or wrong mnemonic).",
+            derived_addr,
+            cfg.sender_bech32
+        );
+    }
+    eprintln!("✓ derived address matches SENDER_BECH32");
+
+    // Convert XPrv payment key to pallas SecretKeyExtended.
+    // extended_secret_key() returns the 64-byte (kL||kR) private portion.
+    let ext_bytes: [u8; 64] = payment_xprv.extended_secret_key();
+    let signing_key = ed25519::SecretKeyExtended::from_bytes(ext_bytes)
+        .map_err(|_| anyhow!("constructing extended signing key from derived payment key"))?;
+    // Shadow the intermediate buffer so it's no longer accessible.
+    let _ = ext_bytes;
+
     let client = reqwest::Client::new();
 
     eprintln!("== Live Swap (Minswap V2) ==");
@@ -284,9 +322,7 @@ async fn main() -> Result<()> {
         ttl,
     )?;
 
-    // 7. Sign.
-    let signing_key = parse_signing_key(&cfg.sender_private_key)
-        .context("parsing SENDER_PRIVATE_KEY")?;
+    // 7. Sign with the derived extended ed25519 payment key.
     let signed = built
         .sign(&signing_key)
         .map_err(|e| anyhow!("signing transaction: {:?}", e))?;
@@ -336,6 +372,90 @@ async fn main() -> Result<()> {
     eprintln!("tx hash: {}", submitted_hash);
     eprintln!("{}/{}", CARDANOSCAN_TX, submitted_hash);
     Ok(())
+}
+
+// ---------- key derivation ----------
+
+/// Derive payment and stake XPrv keys from a BIP-39 mnemonic via CIP-1852 /
+/// CIP-3 Icarus master key derivation, then compute the corresponding mainnet
+/// base address and return it as a bech32 string for the caller to verify.
+///
+/// Derivation path:
+///   payment: m / 1852' / 1815' / 0' / 0 / 0
+///   stake:   m / 1852' / 1815' / 0' / 2 / 0
+///
+/// Master key algorithm: CIP-3 Icarus (PBKDF2-HMAC-SHA512, 4096 iterations,
+/// 96-byte output, then Cardano BIP32-Ed25519 kL bit-tweaks).
+///
+/// SECURITY: mnemonic and passphrase are NEVER echoed in any error message.
+fn derive_account_keys(
+    mnemonic_phrase: &str,
+    passphrase: &str,
+) -> Result<(XPrv, XPrv, String)> {
+    // 1. Parse mnemonic to entropy.
+    let mnemonic = Mnemonic::parse_in_normalized(Language::English, mnemonic_phrase)
+        .map_err(|_| anyhow!("invalid mnemonic"))?;
+    let entropy = mnemonic.to_entropy();
+
+    // 2. Icarus master key derivation per CIP-3 Annex:
+    //    PBKDF2-HMAC-SHA512(password=passphrase, salt=entropy, c=4096, dkLen=96)
+    //    Then split into kL[0..32] || kR[32..64] || cc[64..96] and apply
+    //    Cardano BIP32-Ed25519 bit-tweaks to kL:
+    //      kL[0]  &= 0b1111_1000  (clear low 3 bits)
+    //      kL[31] &= 0b0001_1111  (clear bits 7, 6, 5)
+    //      kL[31] |= 0b0100_0000  (set bit 6)
+    let mut xprv_bytes = [0u8; 96];
+    pbkdf2::pbkdf2_hmac::<sha2::Sha512>(
+        passphrase.as_bytes(),
+        &entropy,
+        4096,
+        &mut xprv_bytes,
+    );
+    xprv_bytes[0]  &= 0b1111_1000;
+    xprv_bytes[31] &= 0b0001_1111;
+    xprv_bytes[31] |= 0b0100_0000;
+
+    let root = XPrv::from_bytes_verified(xprv_bytes)
+        .map_err(|_| anyhow!("invalid root xprv after derivation"))?;
+
+    // 3. Derive m/1852'/1815'/0'/0/0 (payment) and m/1852'/1815'/0'/2/0 (stake).
+    let account_root = root
+        .derive(DerivationScheme::V2, 1852 | HARDENED)
+        .derive(DerivationScheme::V2, 1815 | HARDENED)
+        .derive(DerivationScheme::V2, 0    | HARDENED);
+    let payment = account_root
+        .derive(DerivationScheme::V2, 0)
+        .derive(DerivationScheme::V2, 0);
+    let stake = account_root
+        .derive(DerivationScheme::V2, 2)
+        .derive(DerivationScheme::V2, 0);
+
+    // 4. Compute payment_pkh and stake_kh via Blake2b-224(pubkey).
+    let payment_pub: [u8; 32] = payment.public().public_key();
+    let stake_pub:   [u8; 32] = stake.public().public_key();
+    let payment_pkh = blake2b224(&payment_pub);
+    let stake_kh    = blake2b224(&stake_pub);
+
+    // 5. Build expected mainnet base address (header byte 0x01) and bech32-encode.
+    //    Layout: 0x01 || payment_pkh[28] || stake_kh[28]  (57 bytes total)
+    let mut payload = Vec::with_capacity(57);
+    payload.push(0x01u8); // type-0 base address, mainnet network tag
+    payload.extend_from_slice(&payment_pkh);
+    payload.extend_from_slice(&stake_kh);
+    let hrp = bech32::Hrp::parse("addr")?;
+    let derived_bech32 = bech32::encode::<bech32::Bech32>(hrp, &payload)?;
+
+    Ok((payment, stake, derived_bech32))
+}
+
+/// Blake2b-224 hash of `input` — used for payment key hash and stake key hash.
+///
+/// Uses `pallas_crypto::hash::Hasher::<224>` which is already a transitive dep.
+fn blake2b224(input: &[u8]) -> [u8; 28] {
+    let h = pallas_crypto::hash::Hasher::<224>::hash(input);
+    let mut out = [0u8; 28];
+    out.copy_from_slice(h.as_ref());
+    out
 }
 
 // ---------- transaction builder ----------
@@ -408,57 +528,16 @@ fn token_unit(t: &Token) -> String {
     }
 }
 
-/// Parse an Ed25519 secret key from either:
-///   - a raw 64-character hex string (32 bytes), OR
-///   - a path to a cardano-cli `payment.skey` JSON file
-///     (cborHex = 0x5820 || 32-byte key).
-///
-/// SECURITY: This function NEVER echoes key bytes in error messages.
-fn parse_signing_key(value: &str) -> Result<ed25519::SecretKey> {
-    let trimmed = value.trim();
-
-    // Branch 1: 64-char hex (32-byte raw signing key).
-    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        let bytes = hex::decode(trimmed).map_err(|_| anyhow!("invalid private key format"))?;
-        let arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow!("invalid private key format"))?;
-        return Ok(ed25519::SecretKey::from(arr));
-    }
-
-    // Branch 2: file path to a cardano-cli payment.skey JSON.
-    let path = std::path::Path::new(trimmed);
-    if path.exists() {
-        let json_text =
-            std::fs::read_to_string(path).map_err(|_| anyhow!("invalid private key format"))?;
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json_text).map_err(|_| anyhow!("invalid private key format"))?;
-        let cbor_hex = parsed["cborHex"]
-            .as_str()
-            .ok_or_else(|| anyhow!("invalid private key format"))?;
-        // cardano-cli encodes the 32-byte key as: 0x5820 <32 bytes>
-        let cbor_bytes =
-            hex::decode(cbor_hex).map_err(|_| anyhow!("invalid private key format"))?;
-        if cbor_bytes.len() != 34 || cbor_bytes[0] != 0x58 || cbor_bytes[1] != 0x20 {
-            bail!("invalid private key format");
-        }
-        let arr: [u8; 32] = cbor_bytes[2..]
-            .try_into()
-            .map_err(|_| anyhow!("invalid private key format"))?;
-        return Ok(ed25519::SecretKey::from(arr));
-    }
-
-    bail!("invalid private key format")
-}
-
 // ---------- config ----------
 
 struct Config {
     kupo_url: String,
     bf_project_id: String,
     sender_bech32: String,
-    /// Raw env-var value; parsed lazily by `parse_signing_key`.
-    sender_private_key: String,
+    /// BIP-39 mnemonic phrase; NEVER logged.
+    sender_mnemonic: String,
+    /// Optional spending password / BIP-39 passphrase; NEVER logged.
+    sender_mnemonic_passphrase: String,
     pool_lp_token_unit: String,
     swap_in_unit: String,
     swap_in_amount: u64,
@@ -473,7 +552,7 @@ impl Config {
             "KUPO_URL",
             "BLOCKFROST_PROJECT_ID",
             "SENDER_BECH32",
-            "SENDER_PRIVATE_KEY",
+            "SENDER_MNEMONIC",
             "POOL_LP_TOKEN_UNIT",
             "SWAP_IN_UNIT",
             "SWAP_IN_AMOUNT",
@@ -513,11 +592,16 @@ impl Config {
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(10.0);
 
+        // Passphrase defaults to empty string (most users won't set one).
+        let sender_mnemonic_passphrase = env::var("SENDER_MNEMONIC_PASSPHRASE")
+            .unwrap_or_default();
+
         Ok(Self {
             kupo_url,
             bf_project_id,
             sender_bech32,
-            sender_private_key: env::var("SENDER_PRIVATE_KEY").unwrap(),
+            sender_mnemonic: env::var("SENDER_MNEMONIC").unwrap(),
+            sender_mnemonic_passphrase,
             pool_lp_token_unit: env::var("POOL_LP_TOKEN_UNIT").unwrap(),
             swap_in_unit: env::var("SWAP_IN_UNIT").unwrap(),
             swap_in_amount: env::var("SWAP_IN_AMOUNT")
