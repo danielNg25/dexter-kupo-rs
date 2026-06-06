@@ -152,4 +152,30 @@ impl KupoApi {
         })
         .await
     }
+
+    /// Fetch the most recent checkpoint slot from Kupo's /health endpoint.
+    /// Used to derive a TTL for transactions ("invalid_from_slot").
+    pub async fn tip_slot(&self) -> Result<u64> {
+        let url = format!("{}/health", self.api_url);
+        let response = self.client.get(&url).send().await?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(anyhow::anyhow!("rate_limited"));
+        }
+        let body = response.text().await?;
+        let v: serde_json::Value = serde_json::from_str(&body)?;
+        // Try top-level number first
+        if let Some(n) = v.get("most_recent_checkpoint").and_then(|x| x.as_u64()) {
+            return Ok(n);
+        }
+        // Fall back to nested .slot_no
+        if let Some(n) = v.get("most_recent_checkpoint")
+            .and_then(|x| x.get("slot_no"))
+            .and_then(|x| x.as_u64())
+        {
+            return Ok(n);
+        }
+        Err(anyhow::anyhow!(
+            "could not parse `most_recent_checkpoint` from Kupo /health response"
+        ))
+    }
 }

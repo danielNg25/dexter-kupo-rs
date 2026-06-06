@@ -6,6 +6,7 @@
 //!   cargo run --example live_swap -- --submit    # actually broadcast
 //!
 //! REQUIRED ENV VARS:
+//!   KUPO_URL               local Kupo API URL (http://localhost:1442)
 //!   BLOCKFROST_PROJECT_ID  mainnet Blockfrost project ID (mainnet...)
 //!   SENDER_BECH32          sender mainnet base address   (addr1...)
 //!   SENDER_PRIVATE_KEY     raw 64-char hex OR path to cardano-cli payment.skey JSON
@@ -17,6 +18,8 @@
 //!   SWAP_IN_UNIT           "lovelace" or <policy_hex><name_hex>
 //!   SWAP_IN_AMOUNT         raw u64 amount to swap in
 //!   MIN_RECEIVE            raw u64 minimum receive (limit price)
+//!
+//! NOTE: Kupo must be indexing SENDER_BECH32; start with --match <sender_addr> or a broader pattern.
 //!
 //! Use a FRESH TEST WALLET funded with only the ADA you intend to spend.
 //! NEVER use your main Eternl wallet's seed phrase or payment key.
@@ -53,17 +56,19 @@ async fn main() -> Result<()> {
 
     eprintln!("== Live Swap (Minswap V2) ==");
     eprintln!(
-        "mode:    {}",
+        "mode:      {}",
         if submit {
             "SUBMIT — real ADA will be spent"
         } else {
             "DRY-RUN (pass --submit to broadcast)"
         }
     );
-    eprintln!("sender:  {}", cfg.sender_bech32);
-    eprintln!("pool:    {}", cfg.pool_lp_token_unit);
-    eprintln!("swap in: {} of {}", cfg.swap_in_amount, cfg.swap_in_unit);
-    eprintln!("min rec: {}", cfg.min_receive);
+    eprintln!("kupo:      {}", cfg.kupo_url);
+    eprintln!("blockfrost: (mainnet)");
+    eprintln!("sender:    {}", cfg.sender_bech32);
+    eprintln!("pool:      {}", cfg.pool_lp_token_unit);
+    eprintln!("swap in:   {} of {}", cfg.swap_in_amount, cfg.swap_in_unit);
+    eprintln!("min rec:   {}", cfg.min_receive);
     eprintln!();
 
     // 1. Build the order via the library (verified byte-for-byte against on-chain golden).
@@ -97,7 +102,9 @@ async fn main() -> Result<()> {
     );
     eprintln!();
 
-    // 2. Fetch chain state from Blockfrost.
+    // 2. Fetch chain state from Blockfrost (params) and Kupo (tip slot, wallet UTxOs).
+    let kupo = dexter_kupo_rs::KupoApi::new(&cfg.kupo_url);
+
     let params = blockfrost_get(&client, &cfg.bf_project_id, "/epochs/latest/parameters")
         .await
         .context("fetching protocol params")?;
@@ -109,52 +116,41 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("protocol params: min_fee_b missing or not u64"))?;
     eprintln!("protocol: min_fee_a={} min_fee_b={}", min_fee_a, min_fee_b);
 
-    let block = blockfrost_get(&client, &cfg.bf_project_id, "/blocks/latest")
+    let current_slot = kupo
+        .tip_slot()
         .await
-        .context("fetching latest block")?;
-    let current_slot = block["slot"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("block: slot field missing"))?;
+        .context("fetching tip slot from Kupo")?;
     let ttl = current_slot + 7200; // ~2 hours at 1 slot/s
     eprintln!("slot: current={} ttl={}", current_slot, ttl);
 
-    let utxos_val = blockfrost_get(
-        &client,
-        &cfg.bf_project_id,
-        &format!("/addresses/{}/utxos", cfg.sender_bech32),
-    )
-    .await
-    .context("fetching sender UTxOs")?;
-    let utxos = utxos_val
-        .as_array()
-        .ok_or_else(|| anyhow!("UTxO response is not a JSON array"))?;
-    eprintln!("found {} UTxO(s) at sender address", utxos.len());
+    let utxos = kupo
+        .get(&cfg.sender_bech32, true)
+        .await
+        .context("fetching sender UTxOs from Kupo")?;
+    eprintln!("kupo returned {} UTxO(s) at sender", utxos.len());
     if utxos.is_empty() {
-        bail!("sender address has no UTxOs — fund it with ADA first");
+        bail!(
+            "Kupo returned 0 UTxOs for {}. Check: (a) the wallet is actually funded, and (b) Kupo is indexing this address (started with --match <addr> or a broader pattern).",
+            cfg.sender_bech32
+        );
     }
 
     // 3. Coin selection — pure-ADA UTxOs only (test wallet should be ADA-only).
     //    Largest-first greedy until we cover order + fee + min change.
     let mut ada_utxos: Vec<(String, u64, u64)> = vec![]; // (tx_hash, output_index, lovelace)
-    for u in utxos {
-        let amt = match u["amount"].as_array() {
-            Some(a) => a,
-            None => continue,
-        };
-        if amt.len() != 1 {
+    for u in &utxos {
+        // Only consider pure-ADA UTxOs (single unit: lovelace)
+        if u.amount.len() != 1 {
             continue; // skip multi-asset UTxOs for simplicity
         }
-        if amt[0]["unit"].as_str() != Some("lovelace") {
+        if u.amount[0].unit != "lovelace" {
             continue;
         }
-        let qty: u64 = amt[0]["quantity"]
-            .as_str()
-            .unwrap_or("0")
+        let qty: u64 = u.amount[0]
+            .quantity
             .parse()
             .unwrap_or(0);
-        let tx_hash = u["tx_hash"].as_str().unwrap_or("").to_string();
-        let idx = u["output_index"].as_u64().unwrap_or(0);
-        ada_utxos.push((tx_hash, idx, qty));
+        ada_utxos.push((u.tx_hash.clone(), u.output_index as u64, qty));
     }
     ada_utxos.sort_by(|a, b| b.2.cmp(&a.2)); // largest-first
 
@@ -431,6 +427,7 @@ fn parse_signing_key(value: &str) -> Result<ed25519::SecretKey> {
 // ---------- config ----------
 
 struct Config {
+    kupo_url: String,
     bf_project_id: String,
     sender_bech32: String,
     /// Raw env-var value; parsed lazily by `parse_signing_key`.
@@ -448,6 +445,7 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Self> {
         const REQUIRED: &[&str] = &[
+            "KUPO_URL",
             "BLOCKFROST_PROJECT_ID",
             "SENDER_BECH32",
             "SENDER_PRIVATE_KEY",
@@ -471,6 +469,7 @@ impl Config {
             bail!("missing required env vars: {:?}", missing);
         }
 
+        let kupo_url = env::var("KUPO_URL").unwrap();
         let bf_project_id = env::var("BLOCKFROST_PROJECT_ID").unwrap();
         let sender_bech32 = env::var("SENDER_BECH32").unwrap();
 
@@ -490,6 +489,7 @@ impl Config {
         }
 
         Ok(Self {
+            kupo_url,
             bf_project_id,
             sender_bech32,
             sender_private_key: env::var("SENDER_PRIVATE_KEY").unwrap(),
