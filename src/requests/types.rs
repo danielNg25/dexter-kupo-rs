@@ -104,40 +104,45 @@ pub struct SwapParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Unit;
 
     #[test]
-    fn utxo_ref_serializes_with_all_fields() {
+    fn utxo_ref_serde_round_trips() {
         let r = UtxoRef {
             tx_hash: "cf4ecddde0d81f9ce8fcc881a85eb1f8ccdaf6807f03fea4cd02da896a621776".into(),
             output_index: 0,
             script_hash: "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c".into(),
         };
-        assert_eq!(r.tx_hash.len(), 64);
-        assert_eq!(r.output_index, 0);
-        assert_eq!(r.script_hash.len(), 56);
+        let json = serde_json::to_string(&r).expect("serialize");
+        let back: UtxoRef = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(r, back);
     }
 
     #[test]
-    fn spend_utxo_validator_reference_defaults_to_none() {
+    fn spend_utxo_with_validator_reference_serde_round_trips() {
         let s = SpendUtxo {
-            utxo: crate::models::Utxo {
-                address: String::new(),
-                tx_hash: String::new(),
+            utxo: Utxo {
+                address: "addr1".into(),
+                tx_hash: "aa".repeat(32),
                 tx_index: 0,
                 output_index: 0,
-                amount: vec![Unit { unit: "lovelace".into(), quantity: "0".into() }],
+                amount: vec![],
                 block: String::new(),
                 data_hash: None,
                 inline_datum: None,
                 reference_script_hash: None,
                 datum_type: None,
             },
-            redeemer: None,
+            redeemer: Some("d87a80".into()),
             validator: None,
-            validator_reference: None,
-            signer: None,
+            validator_reference: Some(UtxoRef {
+                tx_hash: "cf4ecddde0d81f9ce8fcc881a85eb1f8ccdaf6807f03fea4cd02da896a621776".into(),
+                output_index: 0,
+                script_hash: "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c".into(),
+            }),
+            signer: Some("addr1".into()),
         };
-        assert!(s.validator_reference.is_none());
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: SpendUtxo = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(s.validator_reference, back.validator_reference);
     }
 }
