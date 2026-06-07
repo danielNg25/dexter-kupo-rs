@@ -293,7 +293,10 @@ impl DexSwap for MinswapV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address::decode_base_address;
+    use crate::dex::swap::DexSwap;
     use crate::models::{Asset, LiquidityPool, Token};
+    use crate::requests::types::{OrderKind, SwapParams};
 
     fn ada_token_pool(reserve_ada: u64, reserve_token: u64, fee_pct: f64) -> LiquidityPool {
         LiquidityPool {
@@ -423,10 +426,6 @@ mod tests {
 
     #[test]
     fn build_update_order_combines_cancel_spend_with_new_swap_output() {
-        use crate::address::decode_base_address;
-        use crate::dex::swap::DexSwap;
-        use crate::requests::types::{OrderKind, SwapParams};
-
         let dex = dex();
         let pool = ada_token_pool(1_000_000_000_000, 5_000_000_000_000, 0.3);
 

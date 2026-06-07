@@ -33,6 +33,10 @@ pub trait DexSwap: Send + Sync {
     /// with `new_swap_params`. Default impl composes `build_swap_order` and
     /// `build_cancel_order`. DEXes whose "update" needs custom redeemer logic
     /// can override this method.
+    ///
+    /// The cancelled funds return to `new_swap_params.sender` (the order owner),
+    /// not `receiver`. The new order's swap-out is paid to `receiver` per the
+    /// usual swap semantics.
     fn build_update_order(
         &self,
         pool: &LiquidityPool,
@@ -44,8 +48,20 @@ pub trait DexSwap: Send + Sync {
         if new_order.is_empty() {
             anyhow::bail!("build_swap_order returned empty PayToAddress list");
         }
+        if new_order.len() != 1 {
+            anyhow::bail!(
+                "build_update_order expects build_swap_order to return exactly 1 PayToAddress; got {}",
+                new_order.len()
+            );
+        }
         if cancel.is_empty() || cancel[0].spend_utxos.is_empty() {
             anyhow::bail!("build_cancel_order returned no spend_utxos");
+        }
+        if cancel.len() != 1 {
+            anyhow::bail!(
+                "build_update_order expects build_cancel_order to return exactly 1 PayToAddress (single-order cancel); got {}",
+                cancel.len()
+            );
         }
         new_order[0].spend_utxos = cancel[0].spend_utxos.clone();
         Ok(new_order)
