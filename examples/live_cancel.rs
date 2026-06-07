@@ -155,24 +155,18 @@ async fn main() -> Result<()> {
     // Prefer validator_reference (reference script UTxO) when the library provides it.
     // On mainnet Minswap V2, this is the published UTxO that carries the 2659-byte script,
     // saving it from the witness set: tx size drops from ~3.8KB to ~1KB.
-    let validator_reference: Option<Input> = if let Some(r) = &spend.validator_reference {
-        let tx_hash_arr: [u8; 32] = hex::decode(&r.tx_hash)
-            .context("decoding validator_reference tx_hash hex")?
-            .try_into()
-            .map_err(|_| anyhow!("validator_reference tx_hash is not 32 bytes"))?;
-        Some(Input::new(
-            pallas_crypto::hash::Hash::<32>::from(tx_hash_arr),
-            r.output_index,
-        ))
-    } else {
-        None
-    };
-    if validator_reference.is_some() {
-        eprintln!("✓ using reference script UTxO {}#{} (saves ~2.6KB in tx witness set)",
-            spend.validator_reference.as_ref().unwrap().tx_hash,
-            spend.validator_reference.as_ref().unwrap().output_index);
-    } else {
-        eprintln!("⚠ no validator_reference; using inline script (2.6KB in witness set)");
+    let validator_reference: Option<Input> = spend.validator_reference
+        .as_ref()
+        .map(|r| -> Result<_> {
+            Ok(Input::new(parse_hash32(&r.tx_hash)?, r.output_index))
+        })
+        .transpose()?;
+    match &spend.validator_reference {
+        Some(r) => eprintln!(
+            "✓ using reference script UTxO {}#{} (saves ~2.6KB in tx witness set)",
+            r.tx_hash, r.output_index
+        ),
+        None => eprintln!("⚠ no validator_reference; using inline script (2.6KB in witness set)"),
     }
 
     // 3. Resolve the collateral UTxO.
