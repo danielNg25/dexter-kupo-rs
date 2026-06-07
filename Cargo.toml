@@ -47,3 +47,7 @@ sha2 = "0.10"
 [[example]]
 name = "live_swap"
 path = "examples/live_swap.rs"
+
+[[example]]
+name = "live_cancel"
+path = "examples/live_cancel.rs"
