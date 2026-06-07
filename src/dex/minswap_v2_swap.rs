@@ -32,6 +32,12 @@ fn fee_mods(pool_fee_percent: f64) -> (u128, u128) {
 
 /// Minswap V2 order script hash — payment credential of every V2 order address.
 pub const ORDER_SCRIPT_HASH: &str = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
+/// The on-chain UTxO that holds the Minswap V2 order script as its
+/// reference_script. Mainnet only. Discovered from tx
+/// `ddb038fae5556b564b04e9dcf6139415d8be3b2e45a4e8c8eba29df79e47d169`.
+pub const ORDER_SCRIPT_REF_UTXO_TX: &str =
+    "cf4ecddde0d81f9ce8fcc881a85eb1f8ccdaf6807f03fea4cd02da896a621776";
+pub const ORDER_SCRIPT_REF_UTXO_INDEX: u64 = 0;
 /// LP token policy id (also the pool validity-asset policy).
 pub const LP_TOKEN_POLICY_ID: &str = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
 /// Cancel redeemer — Constr(1,[]) (`unit`), per dexter's `cancelDatum`.
@@ -272,7 +278,11 @@ impl DexSwap for MinswapV2 {
                     version: PlutusVersion::V2,
                     cbor_hex: ORDER_SCRIPT_CBOR_HEX.to_string(),
                 }),
-                validator_reference: None,
+                validator_reference: Some(crate::requests::types::UtxoRef {
+                    tx_hash: ORDER_SCRIPT_REF_UTXO_TX.to_string(),
+                    output_index: ORDER_SCRIPT_REF_UTXO_INDEX,
+                    script_hash: ORDER_SCRIPT_HASH.to_string(),
+                }),
                 signer: Some(return_address.to_string()),
             }],
         }])
@@ -381,6 +391,14 @@ mod tests {
         assert_eq!(v.version, PlutusVersion::V2);
         assert_eq!(v.cbor_hex, ORDER_SCRIPT_CBOR_HEX);
         assert_eq!(s.signer.as_deref(), Some(unrelated.as_str()));
+        assert_eq!(
+            s.validator_reference.as_ref().map(|r| (r.tx_hash.as_str(), r.output_index)),
+            Some(("cf4ecddde0d81f9ce8fcc881a85eb1f8ccdaf6807f03fea4cd02da896a621776", 0))
+        );
+        assert_eq!(
+            s.validator_reference.as_ref().map(|r| r.script_hash.as_str()),
+            Some(ORDER_SCRIPT_HASH)
+        );
     }
 
     #[test]
