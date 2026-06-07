@@ -7,9 +7,11 @@
 pub mod types;
 pub mod swap;
 pub mod cancel;
+pub mod update;
 
 pub use cancel::CancelSwapRequest;
 pub use swap::SwapRequest;
+pub use update::UpdateSwapRequest;
 pub use types::{
     AddressType, AssetAmount, OrderKind, PayToAddress, PlutusScript, PlutusVersion, SpendUtxo,
     SwapFee, SwapParams, UtxoRef,
