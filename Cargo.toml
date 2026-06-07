@@ -31,3 +31,23 @@ path = "src/main.rs"
 [features]
 default = []
 export = []
+
+[dev-dependencies]
+dotenvy = "0.15"
+pallas-primitives = "1.0"
+pallas-codec = "1.0"
+pallas-crypto = "1.0"
+pallas-addresses = "1.0"
+pallas-txbuilder = "1.0"
+bip39 = "2"
+ed25519-bip32 = "0.4"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+
+[[example]]
+name = "live_swap"
+path = "examples/live_swap.rs"
+
+[[example]]
+name = "live_cancel"
+path = "examples/live_cancel.rs"
