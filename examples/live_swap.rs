@@ -201,7 +201,6 @@ async fn main() -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow!("library produced no datum for order"))?;
     let datum_bytes = hex::decode(datum_hex).context("decoding datum cbor hex")?;
-    // Cardano datum hash = blake2b-256 of the raw CBOR bytes of the datum.
     let datum_hash: Hash<32> = Hasher::<256>::hash(&datum_bytes);
     let order_lovelace = p
         .assets
@@ -216,9 +215,9 @@ async fn main() -> Result<()> {
         order_lovelace,
         order_lovelace as f64 / 1_000_000.0
     );
-    eprintln!("datum hash:     {}", hex::encode(datum_hash));
+    eprintln!("datum hash (for reference): {}", hex::encode(datum_hash));
     eprintln!(
-        "datum ({} bytes): {}",
+        "datum ({} bytes, inline): {}",
         datum_bytes.len(),
         datum_hex
     );
@@ -310,50 +309,56 @@ async fn main() -> Result<()> {
     let sender_addr = PallasAddress::from_bech32(&cfg.sender_bech32)
         .map_err(|e| anyhow!("parsing sender address: {}", e))?;
 
-    // 5. First build pass: measure serialized tx size.
-    let change_first = total_selected - order_lovelace - fee_estimate;
-    let built_first = build_tx(
-        &selected,
-        order_addr.clone(),
-        order_lovelace,
-        datum_hash,
-        sender_addr.clone(),
-        change_first,
-        datum_bytes.clone(),
-        fee_estimate,
-        ttl,
-    )?;
+    // 5. Iterative fee refinement: build → measure → recompute fee → repeat
+    //    until the estimate covers the actual required fee with headroom.
+    //    Each iteration shifts the change output, which can shift CBOR varint
+    //    lengths, which shifts the size, which shifts the fee. Loop until stable.
+    //
+    //    Signature overhead: ~104 bytes per vkey witness (vkey 32 + sig 64 +
+    //    CBOR overhead ~8). One signer here = +110 with slop.
+    //    Safety margin: +200 lovelace over min required (cheap insurance vs.
+    //    submission rejection).
+    const VKEY_WITNESS_OVERHEAD: u64 = 110;
+    const FEE_SAFETY_LOVELACE: u64 = 200;
+    const MAX_FEE_ITERATIONS: usize = 6;
 
-    // Refine fee from actual tx byte length + signature overhead (~100 bytes).
-    let approx_signed_size = built_first.tx_bytes.0.len() as u64 + 100;
-    let refined_fee = min_fee_b + min_fee_a * approx_signed_size;
-    // Clamp to sane bounds; Cardano linear fee for a small tx is typically 170k–220k.
-    fee_estimate = refined_fee.max(170_000).min(500_000);
-    eprintln!(
-        "fee estimate: {} lovelace (tx ~{} bytes)",
-        fee_estimate, approx_signed_size
-    );
-
-    // 6. Second build pass with corrected fee (change absorbs the difference).
-    if total_selected < order_lovelace + fee_estimate + min_change {
-        bail!(
-            "insufficient ADA after fee refinement: need {} lovelace total, have {}",
-            order_lovelace + fee_estimate + min_change,
-            total_selected
+    let mut built = None;
+    let mut converged = false;
+    for iter in 0..MAX_FEE_ITERATIONS {
+        if total_selected < order_lovelace + fee_estimate + min_change {
+            bail!(
+                "insufficient ADA: need {} lovelace, have {}",
+                order_lovelace + fee_estimate + min_change, total_selected
+            );
+        }
+        let change = total_selected - order_lovelace - fee_estimate;
+        let tx = build_tx(
+            &selected,
+            order_addr.clone(),
+            order_lovelace,
+            sender_addr.clone(),
+            change,
+            datum_bytes.clone(),
+            fee_estimate,
+            ttl,
+        )?;
+        let signed_size = tx.tx_bytes.0.len() as u64 + VKEY_WITNESS_OVERHEAD;
+        let required = min_fee_b + min_fee_a * signed_size + FEE_SAFETY_LOVELACE;
+        eprintln!(
+            "fee iter {}: estimate={} required={} tx~{} bytes",
+            iter, fee_estimate, required, signed_size
         );
+        if fee_estimate >= required {
+            built = Some(tx);
+            converged = true;
+            break;
+        }
+        fee_estimate = required;
     }
-    let change_final = total_selected - order_lovelace - fee_estimate;
-    let built = build_tx(
-        &selected,
-        order_addr,
-        order_lovelace,
-        datum_hash,
-        sender_addr,
-        change_final,
-        datum_bytes,
-        fee_estimate,
-        ttl,
-    )?;
+    if !converged {
+        bail!("fee refinement did not converge in {} iterations", MAX_FEE_ITERATIONS);
+    }
+    let built = built.unwrap();
 
     // 7. Sign with the derived extended ed25519 payment key.
     let signed = built
@@ -495,12 +500,14 @@ fn blake2b224(input: &[u8]) -> [u8; 28] {
 
 /// Build a StagingTransaction from pre-selected inputs + computed amounts.
 ///
-/// This is called twice: once for size measurement, once for the final tx.
+/// The order datum is attached INLINE on the order output (CIP-32). This
+/// avoids needing a script_data_hash on the tx body (which would be required
+/// if the datum were placed in the witness set alongside a datum-hash output).
+/// Minswap V2 batchers handle both inline and hash-attached datums.
 fn build_tx(
     selected: &[(String, u64, u64)],
     order_addr: PallasAddress,
     order_lovelace: u64,
-    datum_hash: Hash<32>,
     sender_addr: PallasAddress,
     change_lovelace: u64,
     datum_bytes: Vec<u8>,
@@ -519,17 +526,11 @@ fn build_tx(
     }
 
     tx = tx
-        // Order output (script address, datum hash attached).
         .output(
             Output::new(order_addr, order_lovelace)
-                .set_datum_hash(datum_hash),
+                .set_inline_datum(datum_bytes),
         )
-        // Change back to sender.
         .output(Output::new(sender_addr, change_lovelace))
-        // Add datum bytes to the tx witness set so it's visible on-chain.
-        // (pallas stores it keyed by hash_cbor; batcher picks it up via
-        //  its own indexer, so a key discrepancy doesn't affect correctness.)
-        .datum(datum_bytes)
         .fee(fee)
         .invalid_from_slot(ttl)
         .network_id(1);
