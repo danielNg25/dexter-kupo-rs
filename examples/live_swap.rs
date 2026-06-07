@@ -26,6 +26,10 @@
 //!   LIMIT_PREMIUM_PERCENT       minimum-receive = estimate * (1 + X/100); default 10.0
 //!                               Set to 0 for market order at current price.
 //!                               Set to e.g. 5 to require 5% better-than-current output.
+//!   COLLATERAL_UTXO             Pin a wallet UTxO (`<tx_hash>#<idx>`) to reserve
+//!                               for cancel collateral. Excluded from this swap's
+//!                               coin selection so it survives across cycles. The
+//!                               same env var is read by `examples/live_cancel.rs`.
 //!
 //! The mnemonic is used to derive both payment + stake keys via CIP-1852
 //! (Icarus master key derivation, path m/1852'/1815'/0'/0/0 for payment
@@ -258,6 +262,10 @@ async fn main() -> Result<()> {
 
     // 3. Coin selection — pure-ADA UTxOs only (test wallet should be ADA-only).
     //    Largest-first greedy until we cover order + fee + min change.
+    //    If COLLATERAL_UTXO is set, exclude it so it stays reserved for cancels.
+    if let Some((c_tx, c_idx)) = &cfg.collateral_utxo {
+        eprintln!("✓ reserving COLLATERAL_UTXO {}#{} (excluded from coin selection)", c_tx, c_idx);
+    }
     let mut ada_utxos: Vec<(String, u64, u64)> = vec![]; // (tx_hash, output_index, lovelace)
     for u in &utxos {
         // Only consider pure-ADA UTxOs (single unit: lovelace)
@@ -266,6 +274,12 @@ async fn main() -> Result<()> {
         }
         if u.amount[0].unit != "lovelace" {
             continue;
+        }
+        // Skip the pinned collateral UTxO so it survives this swap.
+        if let Some((c_tx, c_idx)) = &cfg.collateral_utxo {
+            if u.tx_hash == *c_tx && u.output_index as u64 == *c_idx {
+                continue;
+            }
         }
         let qty: u64 = u.amount[0]
             .quantity
@@ -578,6 +592,10 @@ struct Config {
     /// Percentage premium over the current estimated output required to fill.
     /// Defaults to 10.0 if `LIMIT_PREMIUM_PERCENT` is unset.
     limit_premium_percent: f64,
+    /// Optional pinned collateral UTxO, format `<tx_hash>#<idx>`. If set, the
+    /// swap excludes this UTxO from coin selection so it stays available as
+    /// dedicated collateral for cancels.
+    collateral_utxo: Option<(String, u64)>,
 }
 
 impl Config {
@@ -630,6 +648,20 @@ impl Config {
         let sender_mnemonic_passphrase = env::var("SENDER_MNEMONIC_PASSPHRASE")
             .unwrap_or_default();
 
+        let collateral_utxo = env::var("COLLATERAL_UTXO").ok()
+            .map(|s| {
+                let (h, i) = s.split_once('#').ok_or_else(|| {
+                    anyhow!("COLLATERAL_UTXO must be `<tx_hash>#<index>`, got `{}`", s)
+                })?;
+                let idx: u64 = i.parse()
+                    .map_err(|_| anyhow!("COLLATERAL_UTXO index `{}` is not a u64", i))?;
+                if h.len() != 64 || hex::decode(h).is_err() {
+                    bail!("COLLATERAL_UTXO tx_hash `{}` is not 32 hex bytes", h);
+                }
+                Ok::<_, anyhow::Error>((h.to_string(), idx))
+            })
+            .transpose()?;
+
         Ok(Self {
             kupo_url,
             bf_project_id,
@@ -643,6 +675,7 @@ impl Config {
                 .parse::<u64>()
                 .context("SWAP_IN_AMOUNT must be a u64")?,
             limit_premium_percent,
+            collateral_utxo,
         })
     }
 }
