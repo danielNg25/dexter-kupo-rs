@@ -10,7 +10,7 @@ use crate::dex::minswap_v2::MinswapV2;
 use crate::dex::DexSwap;
 use crate::models::{token_identifier, LiquidityPool, Token, Utxo};
 use crate::plutus::PlutusData;
-use crate::requests::{AddressType, AssetAmount, PayToAddress, PlutusScript, PlutusVersion, SpendUtxo, SwapFee, SwapParams};
+use crate::requests::{AddressType, AssetAmount, PayToAddress, PlutusScript, PlutusVersion, SpendUtxo, SwapFee, SwapParams, UtxoRef};
 
 /// Returns `(reserve_for_token, reserve_for_other)` ordered to match `token`.
 fn corresponding_reserves(pool: &LiquidityPool, token: &Token) -> (u128, u128) {
@@ -37,6 +37,7 @@ pub const ORDER_SCRIPT_HASH: &str = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8
 /// `ddb038fae5556b564b04e9dcf6139415d8be3b2e45a4e8c8eba29df79e47d169`.
 pub const ORDER_SCRIPT_REF_UTXO_TX: &str =
     "cf4ecddde0d81f9ce8fcc881a85eb1f8ccdaf6807f03fea4cd02da896a621776";
+/// Output index of [`ORDER_SCRIPT_REF_UTXO_TX`].
 pub const ORDER_SCRIPT_REF_UTXO_INDEX: u64 = 0;
 /// LP token policy id (also the pool validity-asset policy).
 pub const LP_TOKEN_POLICY_ID: &str = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
@@ -278,7 +279,7 @@ impl DexSwap for MinswapV2 {
                     version: PlutusVersion::V2,
                     cbor_hex: ORDER_SCRIPT_CBOR_HEX.to_string(),
                 }),
-                validator_reference: Some(crate::requests::types::UtxoRef {
+                validator_reference: Some(UtxoRef {
                     tx_hash: ORDER_SCRIPT_REF_UTXO_TX.to_string(),
                     output_index: ORDER_SCRIPT_REF_UTXO_INDEX,
                     script_hash: ORDER_SCRIPT_HASH.to_string(),
