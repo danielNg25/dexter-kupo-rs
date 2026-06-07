@@ -1,42 +1,54 @@
-//! Live Minswap V2 order CANCEL example — spends a previously-placed order
-//! UTxO using the cancel redeemer, returning everything to the original sender.
+//! Live Minswap V2 order UPDATE example — atomically spends an existing order
+//! (cancel redeemer) + creates a new order with different swap parameters,
+//! all in a single transaction.
 //!
 //! USAGE:
-//!   cargo run --example live_cancel -- --tx <hash>             # dry-run
-//!   cargo run --example live_cancel -- --tx <hash> --submit    # broadcast
+//!   cargo run --example live_update -- --tx <hash>             # dry-run
+//!   cargo run --example live_update -- --tx <hash> --submit    # broadcast
 //!
 //! ARGS:
-//!   --tx <hash>          required: hash of the swap-placement tx
-//!   --out-index <n>      optional: index of the order output (default 0)
+//!   --tx <hash>          required: hash of the tx that placed the old order
+//!   --out-index <n>      optional: index of the order output in that tx (default 0)
 //!   --submit             optional: actually broadcast (default: dry-run)
 //!
-//! Same env vars as live_swap.rs (KUPO_URL, BLOCKFROST_PROJECT_ID,
-//! SENDER_BECH32, SENDER_MNEMONIC, plus optional SENDER_MNEMONIC_PASSPHRASE).
-//! POOL_LP_TOKEN_UNIT, SWAP_IN_UNIT, SWAP_IN_AMOUNT, LIMIT_PREMIUM_PERCENT
-//! are NOT used here — cancel doesn't care about pool details, just the UTxO.
+//! ENV VARS (superset of live_cancel + live_swap):
+//!   KUPO_URL                   local Kupo API URL (http://localhost:1442)
+//!   BLOCKFROST_PROJECT_ID      mainnet Blockfrost project ID (mainnet...)
+//!   SENDER_BECH32              sender mainnet base address (addr1...)
+//!   SENDER_MNEMONIC            BIP-39 mnemonic (12, 15, 18, 21, or 24 words)
+//!   POOL_LP_TOKEN_UNIT         V2 pool LP token unit: <lp_policy_56_hex><lp_name_hex>
+//!   SWAP_IN_UNIT               "lovelace" or <policy_hex><name_hex>
+//!   SWAP_IN_AMOUNT             raw u64 amount to swap in (for the NEW order)
 //!
-//! OPTIONAL ENV VARS:
-//!   COLLATERAL_UTXO   Pin a specific UTxO as collateral, format `<tx_hash>#<idx>`
-//!                     (e.g., `COLLATERAL_UTXO=abc123...#0`).
-//!                     If unset, the largest pure-ADA UTxO in the wallet is used.
-//!                     RECOMMENDED FOR PRODUCTION: keep one ~10 ADA pure-ADA UTxO
-//!                     set aside and never spend it. Cancels don't consume
-//!                     collateral on success, so it persists across thousands of txs
-//!                     and prevents wallet fragmentation from breaking collateral lookup.
+//! OPTIONAL:
+//!   SENDER_MNEMONIC_PASSPHRASE  BIP-39 passphrase (default: empty)
+//!   LIMIT_PREMIUM_PERCENT       new order min_receive = estimate * (1 + X/100); default 10.0
+//!   COLLATERAL_UTXO             pin a wallet UTxO `<tx_hash>#<idx>` as collateral
 //!
-//! KUPO requirements:
-//!   - Indexing the V2 order script address (or `*`) so the order UTxO is
-//!     findable. Start Kupo with:
-//!       --match addr1z8p79rpkcdz8x9d6tft0x0dx5mwuzac2sa4gm8cvkw5hcn8ftv3526r2y8z8rnlvay76nhpdp9pdekzvd3rrrql08qqssmhdxz
-//!     (your order's address — the part after `addr1z` is the same for everyone)
-//!     OR `--match "*"` for everything.
-//!   - Indexing SENDER_BECH32 (for collateral UTxO lookup).
+//! HOW IT WORKS:
+//!   A Minswap V2 "update" is NOT a special contract redeemer — it is a
+//!   transaction-level pattern: spend the old order (cancel redeemer) AND
+//!   create a brand-new order output in the same tx, referencing the published
+//!   script UTxO (CIP-33) to avoid carrying the 2659-byte validator inline.
+//!
+//!   Result: one atomic tx, expected fee ~0.25 ADA (vs ~0.55 ADA for a
+//!   separate cancel + re-place).
+//!
+//! BALANCE MODEL:
+//!   - Inputs:  old order UTxO (script) + 1 wallet UTxO (fee source)
+//!   - Outputs: new order at script address (inline datum) + wallet change
+//!   The fee is taken from the wallet input, keeping the new order's ADA
+//!   amount identical to what the library specifies.
+//!
+//! # Safety
+//!   Default mode is DRY-RUN.  Pass --submit to broadcast.  Real ADA spent.
 
 use anyhow::{anyhow, bail, Context, Result};
 use bip39::{Language, Mnemonic};
 use dexter_kupo_rs::{
-    dex::minswap_v2::MinswapV2,
-    CancelSwapRequest, KupoApi,
+    dex::{minswap_v2::MinswapV2, BaseDex, DexSwap},
+    models::{token_identifier, Asset, Token},
+    KupoApi, UpdateSwapRequest,
 };
 use ed25519_bip32::{DerivationScheme, XPrv};
 use pallas_addresses::Address as PallasAddress;
@@ -68,7 +80,7 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = env::args().collect();
     let submit = args.iter().any(|a| a == "--submit");
-    let tx_hash = parse_flag(&args, "--tx")
+    let old_tx_hash = parse_flag(&args, "--tx")
         .context("--tx <hash> is required")?;
     let out_index: u64 = parse_flag(&args, "--out-index")
         .unwrap_or_else(|_| "0".to_string())
@@ -77,6 +89,7 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env().context("loading env vars")?;
 
+    // ── Key derivation ─────────────────────────────────────────────────────────
     let (payment_xprv, _stake_xprv, derived_addr) =
         derive_account_keys(&cfg.sender_mnemonic, &cfg.sender_mnemonic_passphrase)
             .context("deriving keys from mnemonic")?;
@@ -93,7 +106,8 @@ async fn main() -> Result<()> {
         .map_err(|_| anyhow!("building signing key"))?;
     let _ = ext_bytes;
 
-    // Payment key hash (Blake2b-224 of pubkey) — needed for required_signers.
+    // Payment key hash (Blake2b-224 of pubkey) — required signer so the cancel
+    // script's signer check passes.
     let payment_pub: [u8; 32] = payment_xprv.public().public_key();
     let payment_pkh: [u8; 28] = {
         let h = pallas_crypto::hash::Hasher::<224>::hash(&payment_pub);
@@ -104,57 +118,110 @@ async fn main() -> Result<()> {
 
     let client = reqwest::Client::new();
 
-    eprintln!("== Live Cancel (Minswap V2) ==");
+    eprintln!("== Live Update (Minswap V2) ==");
     eprintln!("mode:   {}", if submit { "SUBMIT" } else { "DRY-RUN" });
-    eprintln!("order:  {}@{}", out_index, tx_hash);
+    eprintln!("order:  {}@{}", out_index, old_tx_hash);
     eprintln!("sender: {}", cfg.sender_bech32);
+    eprintln!("pool:   {}", cfg.pool_lp_token_unit);
+    eprintln!("swap in (new order): {} of {}", cfg.swap_in_amount, cfg.swap_in_unit);
     eprintln!();
 
     let kupo = KupoApi::new(&cfg.kupo_url);
     let dex = MinswapV2::new(KupoApi::new(&cfg.kupo_url));
 
-    // 1. Look up the order UTxO. Kupo accepts `{output_index}@{tx_hash}` as a query pattern.
-    let order_ref = format!("{}@{}", out_index, tx_hash);
+    // 1. Look up the old order UTxO.
+    let order_ref = format!("{}@{}", out_index, old_tx_hash);
     let order_utxos = kupo.get(&order_ref, true).await
         .context("fetching order UTxO from Kupo")?;
     if order_utxos.is_empty() {
         bail!(
-            "order UTxO {} not found at Kupo. Either (a) the UTxO was already spent (filled or cancelled), or (b) Kupo is not indexing the order script address. Add `--match <order_script_addr>` to Kupo or use `--match \"*\"`.",
+            "order UTxO {} not found at Kupo. Either (a) already spent (filled/cancelled), \
+             or (b) Kupo is not indexing the order script address. \
+             Add `--match <order_script_addr>` or `--match \"*\"`.",
             order_ref
         );
     }
-    let order_utxo = order_utxos[0].clone();
-    eprintln!("✓ order UTxO found at {}", order_utxo.address);
-    eprintln!("  amount: {:?}", order_utxo.amount);
-
-    let order_lovelace: u64 = order_utxo
+    let old_order_utxo = order_utxos[0].clone();
+    let old_order_lovelace: u64 = old_order_utxo
         .amount
         .iter()
         .find(|a| a.unit == "lovelace")
         .ok_or_else(|| anyhow!("order UTxO has no lovelace"))?
         .quantity
         .parse()?;
+    eprintln!("✓ old order UTxO found at {}", old_order_utxo.address);
+    eprintln!("  amount: {:?}", old_order_utxo.amount);
 
-    // 2. Build the cancel request via the library.
-    let pays = CancelSwapRequest::new(&dex)
-        .with_order_utxos(vec![order_utxo.clone()])
-        .with_return_address(&cfg.sender_bech32)
+    // 2. Fetch pool, compute new min_receive.
+    let pool = dex.liquidity_pool_from_pool_id(&cfg.pool_lp_token_unit).await
+        .context("fetching pool from Kupo (is Kupo indexing the V2 validity asset?)")?
+        .ok_or_else(|| anyhow!(
+            "no pool found for LP token unit `{}`. Verify (a) the unit is correct and \
+             (b) Kupo is indexing the Minswap V2 validity asset.",
+            cfg.pool_lp_token_unit
+        ))?;
+
+    eprintln!("pool fetched from Kupo:");
+    eprintln!("  assets:   {} / {}", token_unit(&pool.asset_a), token_unit(&pool.asset_b));
+    eprintln!("  reserves: {} / {}", pool.reserve_a, pool.reserve_b);
+    eprintln!("  fee:      {}%", pool.pool_fee_percent);
+
+    let swap_in = token_from_unit(&cfg.swap_in_unit)?;
+    let in_id = token_identifier(&swap_in);
+    let a_id = token_identifier(&pool.asset_a);
+    let b_id = token_identifier(&pool.asset_b);
+    if in_id != a_id && in_id != b_id {
+        bail!(
+            "SWAP_IN_UNIT `{}` is not in the pool. Pool assets: `{}` / `{}`.",
+            cfg.swap_in_unit, a_id, b_id
+        );
+    }
+
+    let estimated = dex.estimated_receive(&pool, &swap_in, cfg.swap_in_amount);
+    let multiplier = 1.0 + cfg.limit_premium_percent / 100.0;
+    let min_receive = (estimated as f64 * multiplier).floor() as u64;
+
+    eprintln!();
+    eprintln!("new order pricing:");
+    eprintln!("  current estimate:     {} raw out", estimated);
+    eprintln!("  limit premium:        +{}%", cfg.limit_premium_percent);
+    eprintln!("  computed min_receive: {}", min_receive);
+    eprintln!();
+
+    // 3. Build via UpdateSwapRequest — single PayToAddress combining:
+    //    - p.address / p.assets / p.datum  → new order output (inline datum)
+    //    - p.spend_utxos[0]               → old order spend (cancel redeemer + ref script)
+    let pays = UpdateSwapRequest::new(&dex)
+        .with_old_order_utxos(vec![old_order_utxo.clone()])
+        .for_pool(pool)
+        .with_swap_in_token(swap_in)
+        .with_swap_in_amount(cfg.swap_in_amount)
+        .with_minimum_receive(min_receive)
+        .with_sender_address(&cfg.sender_bech32)?
         .build()?;
     let p = &pays[0];
+
+    let datum_hex = p.datum.as_deref()
+        .ok_or_else(|| anyhow!("library produced no datum for new order"))?;
+    let datum_bytes = hex::decode(datum_hex).context("decoding datum cbor hex")?;
+    let new_order_lovelace: u64 = p.assets
+        .iter()
+        .find(|a| a.unit == "lovelace")
+        .ok_or_else(|| anyhow!("new order output missing lovelace"))?
+        .quantity;
+
     let spend = &p.spend_utxos[0];
-    let script_cbor = hex::decode(&spend.validator.as_ref()
-        .ok_or_else(|| anyhow!("library missing validator"))?
-        .cbor_hex)
-        .context("decoding script cbor")?;
+    let script_cbor = hex::decode(
+        &spend.validator.as_ref()
+            .ok_or_else(|| anyhow!("library missing validator"))?
+            .cbor_hex
+    ).context("decoding script cbor")?;
     let redeemer_cbor = hex::decode(
         spend.redeemer.as_ref().ok_or_else(|| anyhow!("library missing redeemer"))?,
     )?;
-    eprintln!("✓ cancel built: script {} bytes, redeemer {} bytes",
-        script_cbor.len(), redeemer_cbor.len());
 
-    // Prefer validator_reference (reference script UTxO) when the library provides it.
-    // On mainnet Minswap V2, this is the published UTxO that carries the 2659-byte script,
-    // saving it from the witness set: tx size drops from ~3.8KB to ~1KB.
+    // Prefer the reference script (CIP-33): Minswap V2 on mainnet always has it.
+    // This keeps tx size at ~1KB instead of ~3.8KB and cuts fee accordingly.
     let validator_reference: Option<Input> = spend.validator_reference
         .as_ref()
         .map(|r| -> Result<_> {
@@ -163,18 +230,28 @@ async fn main() -> Result<()> {
         .transpose()?;
     match &spend.validator_reference {
         Some(r) => eprintln!(
-            "✓ using reference script UTxO {}#{} (saves ~2.6KB in tx witness set)",
+            "✓ using reference script UTxO {}#{} (saves ~2.6KB in witness set)",
             r.tx_hash, r.output_index
         ),
         None => eprintln!("⚠ no validator_reference; using inline script (2.6KB in witness set)"),
     }
 
-    // 3. Resolve the collateral UTxO.
-    //    Required size = collateral_percent (150%) × tx_fee (~0.5 ADA) = ~0.75 ADA,
-    //    plus Cardano's min-UTxO floor (~1 ADA). 2 ADA is enough headroom.
+    eprintln!("new order address:  {}", p.address);
+    eprintln!(
+        "new order lovelace: {} ({:.6} ADA)",
+        new_order_lovelace,
+        new_order_lovelace as f64 / 1_000_000.0
+    );
+    eprintln!(
+        "datum ({} bytes, inline): {}",
+        datum_bytes.len(),
+        datum_hex
+    );
+    eprintln!();
+
+    // 4. Collateral UTxO.
     const MIN_COLLATERAL_LOVELACE: u64 = 2_000_000;
     let collateral = if let Some((c_tx, c_idx)) = &cfg.collateral_utxo {
-        // Pinned mode: look up the exact UTxO and validate it.
         let pattern = format!("{}@{}", c_idx, c_tx);
         let utxos = kupo.get(&pattern, true).await
             .with_context(|| format!("fetching pinned collateral {} from Kupo", pattern))?;
@@ -186,7 +263,7 @@ async fn main() -> Result<()> {
             ))?;
         if u.address != cfg.sender_bech32 {
             bail!(
-                "COLLATERAL_UTXO {} is at address {}, not at SENDER_BECH32 {}",
+                "COLLATERAL_UTXO {} is at address {}, not SENDER_BECH32 {}",
                 pattern, u.address, cfg.sender_bech32
             );
         }
@@ -197,7 +274,7 @@ async fn main() -> Result<()> {
             );
         }
         let qty: u64 = u.amount[0].quantity.parse()
-            .map_err(|_| anyhow!("COLLATERAL_UTXO {} quantity not u64", pattern))?;
+            .map_err(|_| anyhow!("COLLATERAL_UTXO quantity not u64"))?;
         if qty < MIN_COLLATERAL_LOVELACE {
             bail!(
                 "COLLATERAL_UTXO {} has only {} lovelace, need at least {}",
@@ -207,9 +284,6 @@ async fn main() -> Result<()> {
         eprintln!("✓ using pinned COLLATERAL_UTXO {}", pattern);
         (u, qty)
     } else {
-        // Auto mode: pick the largest pure-ADA UTxO in the wallet.
-        // Note: cancelled orders return ~4 ADA UTxOs which fragment the wallet
-        // quickly; if this fails, set COLLATERAL_UTXO to pin a specific UTxO.
         let wallet_utxos = kupo.get(&cfg.sender_bech32, true).await
             .context("fetching wallet UTxOs from Kupo")?;
         wallet_utxos.iter()
@@ -221,17 +295,66 @@ async fn main() -> Result<()> {
             .max_by_key(|(_, q)| *q)
             .ok_or_else(|| anyhow!(
                 "no pure-ADA UTxO >= {} lovelace in wallet for collateral. \
-                 Either top up the wallet, or set COLLATERAL_UTXO=<tx_hash>#<idx> \
-                 to pin a specific UTxO.",
+                 Either top up the wallet, or set COLLATERAL_UTXO=<tx_hash>#<idx>.",
                 MIN_COLLATERAL_LOVELACE
             ))?
     };
     eprintln!("✓ collateral: {}@{} ({} lovelace)",
         collateral.0.output_index, collateral.0.tx_hash, collateral.1);
+
+    // 5. Wallet UTxO for fee.  We need a pure-ADA wallet input to cover the tx
+    //    fee so the new order can receive the exact amount the library specifies.
+    //    (Balance model: old_order_lovelace → new order; wallet_input → fee + change.)
+    let wallet_utxos = kupo.get(&cfg.sender_bech32, true).await
+        .context("fetching wallet UTxOs from Kupo")?;
+    eprintln!("kupo returned {} UTxO(s) at sender", wallet_utxos.len());
+
+    // The chosen collateral UTxO (pinned or auto-picked) must NOT also be used
+    // as a regular fee input — the Cardano ledger rejects a tx that lists the
+    // same UTxO in both `inputs` and `collateral_inputs`.
+    let collateral_ref: (String, u64) =
+        (collateral.0.tx_hash.clone(), collateral.0.output_index as u64);
+    eprintln!("✓ reserving collateral UTxO {}#{} from fee coin selection",
+        collateral_ref.0, collateral_ref.1);
+
+    // Fee: taken from wallet input (pure-ADA), NOT from the new order's lovelace.
+    // This keeps new_order_lovelace identical to what the library computed (5 ADA).
+    let fee_estimate_initial: u64 = 300_000; // generous initial estimate for coin selection
+    let min_change: u64 = 1_500_000;
+    let target_wallet = fee_estimate_initial + min_change;
+
+    let mut fee_utxo_candidates: Vec<(String, u64, u64)> = vec![];
+    for u in &wallet_utxos {
+        if u.amount.len() != 1 || u.amount[0].unit != "lovelace" {
+            continue;
+        }
+        // Exclude the collateral UTxO (covers both pinned + auto modes since
+        // collateral_ref always reflects whichever UTxO was actually chosen).
+        if u.tx_hash == collateral_ref.0 && u.output_index as u64 == collateral_ref.1 {
+            continue;
+        }
+        let qty: u64 = u.amount[0].quantity.parse().unwrap_or(0);
+        fee_utxo_candidates.push((u.tx_hash.clone(), u.output_index as u64, qty));
+    }
+    fee_utxo_candidates.sort_by(|a, b| b.2.cmp(&a.2));
+
+    // Pick just one wallet input (the largest) if it covers fee + change.
+    let fee_input = fee_utxo_candidates.first()
+        .ok_or_else(|| anyhow!(
+            "no pure-ADA wallet UTxOs available for fee. \
+             Top up the wallet or ensure COLLATERAL_UTXO is not your only UTxO."
+        ))?;
+    if fee_input.2 < target_wallet {
+        bail!(
+            "largest wallet UTxO ({} lovelace) is too small for fee ({}) + min_change ({}).",
+            fee_input.2, fee_estimate_initial, min_change
+        );
+    }
+    eprintln!("✓ fee wallet input: {}#{} ({} lovelace)",
+        fee_input.0, fee_input.1, fee_input.2);
     eprintln!();
 
-    // 4. Fetch protocol params: fee coefficients, script-price coefficients,
-    //    PlutusV2 cost model (for the script_data_hash).
+    // 6. Fetch protocol params.
     let params = blockfrost_get(&client, &cfg.bf_project_id, "/epochs/latest/parameters")
         .await
         .context("fetching protocol params")?;
@@ -239,24 +362,18 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("min_fee_a missing"))?;
     let min_fee_b = params["min_fee_b"].as_u64()
         .ok_or_else(|| anyhow!("min_fee_b missing"))?;
-    let price_mem = parse_price(&params["price_mem"])
-        .context("parsing price_mem")?;
-    let price_step = parse_price(&params["price_step"])
-        .context("parsing price_step")?;
+    let price_mem = parse_price(&params["price_mem"]).context("parsing price_mem")?;
+    let price_step = parse_price(&params["price_step"]).context("parsing price_step")?;
     let collateral_percent = params["collateral_percent"].as_u64().unwrap_or(150);
     // Conway-era reference-script fee: per-byte cost charged for every byte of
     // reference script attached to the tx. For our single sub-25.6KB script,
     // ref_script_fee = script_size_bytes * coins_per_byte (no tiering needed).
-    // Try multiple field name variants Blockfrost has used; default to 15.0.
     let ref_script_cost_per_byte: f64 = params["min_fee_ref_script_cost_per_byte"]
         .as_f64()
         .or_else(|| params["min_fee_ref_script_cost_per_byte"].as_str().and_then(|s| s.parse().ok()))
         .or_else(|| params["min_fee_ref_script_coins_per_byte"].as_f64())
         .or_else(|| params["min_fee_ref_script_coins_per_byte"].as_str().and_then(|s| s.parse().ok()))
         .unwrap_or(15.0);
-    // Conway-era Blockfrost: `cost_models_raw.PlutusV2` is the flat ordered array;
-    // `cost_models.PlutusV2` is an object keyed by parameter name (unordered).
-    // Older endpoints returned the array directly under `cost_models.PlutusV2`.
     let cost_v2: Vec<i64> = if let Some(arr) = params["cost_models_raw"]["PlutusV2"].as_array() {
         arr.iter()
             .map(|v| v.as_i64().ok_or_else(|| anyhow!("cost_models_raw entry not i64")))
@@ -267,7 +384,8 @@ async fn main() -> Result<()> {
             .collect::<Result<Vec<_>>>()?
     } else {
         bail!(
-            "could not find PlutusV2 cost model array under `cost_models_raw.PlutusV2` or `cost_models.PlutusV2`. response keys: {:?}",
+            "could not find PlutusV2 cost model under `cost_models_raw.PlutusV2` or `cost_models.PlutusV2`. \
+             response keys: {:?}",
             params.as_object().map(|m| m.keys().collect::<Vec<_>>())
         );
     };
@@ -279,79 +397,94 @@ async fn main() -> Result<()> {
     eprintln!("slot: current={} ttl={}", current_slot, ttl);
     eprintln!();
 
-    // 5. Build pass with PLACEHOLDER ex_units, evaluate via Blockfrost.
-    let order_input = Input::new(parse_hash32(&tx_hash)?, out_index);
+    // 7. Eval pass: placeholder ex_units + placeholder fee.
+    let order_script_input = Input::new(parse_hash32(&old_tx_hash)?, out_index);
+    let fee_wallet_input = Input::new(parse_hash32(&fee_input.0)?, fee_input.1);
     let collateral_input = Input::new(
         parse_hash32(&collateral.0.tx_hash)?,
         collateral.0.output_index as u64,
     );
-    let return_addr = PallasAddress::from_bech32(&cfg.sender_bech32)
+    let new_order_addr = PallasAddress::from_bech32(&p.address)
+        .map_err(|e| anyhow!("parsing order script address: {}", e))?;
+    let sender_addr = PallasAddress::from_bech32(&cfg.sender_bech32)
         .map_err(|e| anyhow!("parsing sender address: {}", e))?;
+
+    // Build new order output: carry any non-lovelace assets from the library spec.
+    // (The library puts the swap-in token on the order output when swapping a native token.)
+    let new_order_extra_assets: Vec<(String, u64)> = p.assets.iter()
+        .filter(|a| a.unit != "lovelace")
+        .map(|a| (a.unit.clone(), a.quantity))
+        .collect();
+
     let placeholder_ex = ExUnits { mem: 14_000_000, steps: 10_000_000_000 };
+    let eval_fee: u64 = 1_000_000;
+    let eval_change = fee_input.2 - eval_fee;
 
-    // First we need a rough fee guess to make a balanced tx for evaluation.
-    // 1 ADA is plenty for the eval-only pass; we'll refine after.
-    let mut fee_estimate: u64 = 1_000_000;
-    let return_lovelace = order_lovelace - fee_estimate;
-
-    let tx_for_eval = build_cancel_tx(
-        order_input,
-        collateral_input,
-        &order_utxo,
-        return_addr.clone(),
-        return_lovelace,
+    let tx_for_eval = build_update_tx(
+        order_script_input.clone(),
+        fee_wallet_input.clone(),
+        collateral_input.clone(),
+        new_order_addr.clone(),
+        new_order_lovelace,
+        &new_order_extra_assets,
+        sender_addr.clone(),
+        eval_change,
+        datum_bytes.clone(),
         &script_cbor,
         validator_reference.clone(),
         &redeemer_cbor,
         placeholder_ex,
         Hash::<28>::from(payment_pkh),
         cost_v2.clone(),
-        fee_estimate,
+        eval_fee,
         ttl,
     )?;
+
     let unsigned_built = tx_for_eval.build_conway_raw()
-        .map_err(|e| anyhow!("initial build for evaluation: {:?}", e))?;
+        .map_err(|e| anyhow!("initial build for eval: {:?}", e))?;
     eprintln!("evaluating script via Blockfrost...");
     let real_ex = blockfrost_evaluate(&client, &cfg.bf_project_id, &unsigned_built.tx_bytes.0).await
         .context("Blockfrost /utils/txs/evaluate")?;
     eprintln!("✓ script costs: mem={} steps={}", real_ex.mem, real_ex.steps);
 
-    // 6. Compute script fee + iteratively refine total fee.
+    // 8. Compute script fee + iterative refinement.
     let script_fee = ceil_div(real_ex.mem as u128 * price_mem.0 as u128, price_mem.1 as u128)
         + ceil_div(real_ex.steps as u128 * price_step.0 as u128, price_step.1 as u128);
     let script_fee = script_fee as u64;
     // Conway-era ref-script fee: charged per byte of any reference script
     // attached via reference_input. Only applies when validator_reference is in use.
-    // For a single sub-25,600-byte script (Minswap V2 = 2,659 bytes), no tiering.
     let ref_script_fee: u64 = match &spend.validator_reference {
         Some(r) => (r.script_size_bytes as f64 * ref_script_cost_per_byte).ceil() as u64,
         None => 0,
     };
     eprintln!("script fee: {} lovelace; ref_script fee: {} lovelace", script_fee, ref_script_fee);
 
-    const VKEY_WITNESS_OVERHEAD: u64 = 220; // payment vkey + signature, plus we sign once
+    const VKEY_WITNESS_OVERHEAD: u64 = 220;
     const FEE_SAFETY: u64 = 500;
     const MAX_ITERS: usize = 6;
 
-    // Reset to a small estimate so the fixpoint loop converges to the actual
-    // minimum required fee instead of locking in the 1 ADA eval-pass placeholder.
-    // 200_000 is well below any realistic Plutus cancel fee, so the first
-    // iteration will compute `required` and we bump up from there.
-    fee_estimate = 200_000;
-
+    let mut fee_estimate: u64 = 200_000;
     let mut built = None;
     let mut converged = false;
+
     for iter in 0..MAX_ITERS {
-        if order_lovelace < fee_estimate + 1_000_000 {
-            bail!("order UTxO ({}) cannot cover fee ({}) + min return", order_lovelace, fee_estimate);
+        if fee_input.2 < fee_estimate + min_change {
+            bail!(
+                "wallet UTxO ({} lovelace) cannot cover fee ({}) + min_change ({})",
+                fee_input.2, fee_estimate, min_change
+            );
         }
-        let return_lovelace = order_lovelace - fee_estimate;
-        let tx = build_cancel_tx(
-            Input::new(parse_hash32(&tx_hash)?, out_index),
-            Input::new(parse_hash32(&collateral.0.tx_hash)?, collateral.0.output_index as u64),
-            &order_utxo,
-            return_addr.clone(),
-            return_lovelace,
+        let change = fee_input.2 - fee_estimate;
+        let tx = build_update_tx(
+            order_script_input.clone(),
+            fee_wallet_input.clone(),
+            collateral_input.clone(),
+            new_order_addr.clone(),
+            new_order_lovelace,
+            &new_order_extra_assets,
+            sender_addr.clone(),
+            change,
+            datum_bytes.clone(),
             &script_cbor,
             validator_reference.clone(),
             &redeemer_cbor,
@@ -382,7 +515,7 @@ async fn main() -> Result<()> {
     }
     let built = built.unwrap();
 
-    // Required collateral coverage check.
+    // Collateral coverage check.
     let required_collateral = (fee_estimate * collateral_percent + 99) / 100;
     if collateral.1 < required_collateral {
         bail!(
@@ -391,15 +524,22 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 7. Sign.
+    // 9. Sign.
     let signed = built.sign(&signing_key)
         .map_err(|e| anyhow!("sign: {:?}", e))?;
     let tx_cbor = hex::encode(&signed.tx_bytes.0);
     let tx_hash_out = hex::encode(signed.tx_hash.0);
+
     eprintln!();
-    eprintln!("=== Signed cancel tx ready ===");
+    eprintln!("=== Signed update tx ready ===");
     eprintln!("tx hash: {}", tx_hash_out);
     eprintln!("tx size: {} bytes", signed.tx_bytes.0.len());
+    eprintln!("fee:     {} lovelace ({:.6} ADA)", fee_estimate, fee_estimate as f64 / 1_000_000.0);
+    eprintln!(
+        "old ADA: {:.6} ADA  →  new ADA: {:.6} ADA (fee paid from wallet input)",
+        old_order_lovelace as f64 / 1_000_000.0,
+        new_order_lovelace as f64 / 1_000_000.0
+    );
     eprintln!("tx cbor: {}", tx_cbor);
     eprintln!("inspect: {}/{}", CARDANOSCAN_TX, tx_hash_out);
     eprintln!();
@@ -410,7 +550,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 8. Submit.
+    // 10. Submit.
     eprintln!("=== SUBMITTING ===");
     let resp = client.post(format!("{}/tx/submit", BLOCKFROST_BASE))
         .header("project_id", &cfg.bf_project_id)
@@ -432,13 +572,23 @@ async fn main() -> Result<()> {
 
 // ---------- tx builder ----------
 
+/// Build a StagingTransaction for the update:
+///   - old order input (script) with cancel redeemer + reference script (or inline)
+///   - wallet input (fee source)
+///   - collateral input
+///   - new order output (inline datum) + change output
+///   - required signer (payment PKH) so cancel script's signer check passes
 #[allow(clippy::too_many_arguments)]
-fn build_cancel_tx(
+fn build_update_tx(
     order_input: Input,
+    wallet_input: Input,
     collateral_input: Input,
-    order_utxo: &dexter_kupo_rs::models::Utxo,
-    return_addr: PallasAddress,
-    return_lovelace: u64,
+    new_order_addr: PallasAddress,
+    new_order_lovelace: u64,
+    new_order_extra_assets: &[(String, u64)],
+    sender_addr: PallasAddress,
+    change_lovelace: u64,
+    datum_bytes: Vec<u8>,
     script_cbor: &[u8],
     validator_reference: Option<Input>,
     redeemer_cbor: &[u8],
@@ -448,26 +598,32 @@ fn build_cancel_tx(
     fee: u64,
     ttl: u64,
 ) -> Result<StagingTransaction> {
-    // Return output: send back all of the order UTxO's assets to the sender,
-    // minus the fee taken from lovelace.
-    let mut out = Output::new(return_addr, return_lovelace);
-    for unit in &order_utxo.amount {
-        if unit.unit == "lovelace" {
-            continue; // handled by Output::new
+    // Note: the old order's extra native tokens (if any) are NOT returned to
+    // the sender in the update tx — they are consumed into the new order via
+    // `new_order_extra_assets`. For Minswap V2 ADA→TOKEN and TOKEN→ADA orders
+    // the order UTxO is always pure-ADA or holds exactly the swap-in token,
+    // both of which are accounted for above. To handle exotic cases (e.g.,
+    // surplus native tokens), pass through the old order's amount list and
+    // emit a separate return output here.
+    // Build the new order output with inline datum.
+    let mut new_order_out = Output::new(new_order_addr, new_order_lovelace)
+        .set_inline_datum(datum_bytes);
+    for (unit, qty) in new_order_extra_assets {
+        if unit.len() < 56 {
+            bail!("malformed asset unit on new order: {}", unit);
         }
-        // Asset unit is "<policy_hex><name_hex>" with no dot.
-        if unit.unit.len() < 56 {
-            bail!("malformed asset unit on order UTxO: {}", unit.unit);
-        }
-        let (policy_hex, name_hex) = unit.unit.split_at(56);
+        let (policy_hex, name_hex) = unit.split_at(56);
         let policy: [u8; 28] = hex::decode(policy_hex)?
             .try_into()
             .map_err(|_| anyhow!("policy id not 28 bytes"))?;
         let name: Vec<u8> = hex::decode(name_hex)?;
-        let qty: u64 = unit.quantity.parse()?;
-        out = out.add_asset(Hash::<28>::from(policy), name, qty)
-            .map_err(|e| anyhow!("add_asset: {:?}", e))?;
+        new_order_out = new_order_out
+            .add_asset(Hash::<28>::from(policy), name, *qty)
+            .map_err(|e| anyhow!("add_asset to new order: {:?}", e))?;
     }
+
+    // Change output: wallet_input lovelace minus fee.
+    let change_out = Output::new(sender_addr, change_lovelace);
 
     let mut language_map = BTreeMap::new();
     language_map.insert(1u8, plutus_v2_cost_model);
@@ -475,13 +631,17 @@ fn build_cancel_tx(
 
     let mut tx = StagingTransaction::new()
         .input(order_input.clone())
+        .input(wallet_input)
         .collateral_input(collateral_input)
-        .output(out);
+        .output(new_order_out)
+        .output(change_out);
+
     if let Some(ref_input) = validator_reference {
         tx = tx.reference_input(ref_input);
     } else {
         tx = tx.script(ScriptKind::PlutusV2, script_cbor.to_vec());
     }
+
     let tx = tx
         .add_spend_redeemer(order_input, redeemer_cbor.to_vec(), Some(ex_units))
         .disclosed_signer(payment_pkh)
@@ -511,15 +671,13 @@ async fn blockfrost_get(client: &reqwest::Client, project_id: &str, path: &str)
 
 /// POST raw tx CBOR to /utils/txs/evaluate, parse first spend redeemer's ex_units.
 ///
-/// Blockfrost response (older Ogmios-style):
-///   { "result": { "EvaluationResult": { "spend:0": {"memory": N, "steps": M} } } }
-/// Or (newer Ogmios 6 shape):
-///   { "result": [ { "validator": {"purpose":"spend","index":0}, "budget": {"memory":N,"cpu":M} } ] }
+/// Blockfrost response shapes (tries both Ogmios 5 and Ogmios 6 formats):
+///   Old: { "result": { "EvaluationResult": { "spend:0": {"memory":N,"steps":M} } } }
+///   New: { "result": [ { "validator": {"purpose":"spend","index":0}, "budget": {"memory":N,"cpu":M} } ] }
 async fn blockfrost_evaluate(client: &reqwest::Client, project_id: &str, tx_bytes: &[u8])
     -> Result<ExUnits>
 {
     let url = format!("{}/utils/txs/evaluate", BLOCKFROST_BASE);
-    // Blockfrost expects hex-encoded CBOR as application/cbor body.
     let hex_body = hex::encode(tx_bytes);
     let resp = client.post(&url)
         .header("project_id", project_id)
@@ -535,19 +693,15 @@ async fn blockfrost_evaluate(client: &reqwest::Client, project_id: &str, tx_byte
     let v: serde_json::Value = serde_json::from_str(&body)
         .context("parsing evaluate response JSON")?;
 
-    // Try old shape first: result.EvaluationResult.{"spend:0": {memory, steps}}
     if let Some(map) = v["result"]["EvaluationResult"].as_object() {
         for (k, val) in map {
             if k.starts_with("spend:") {
-                let mem = val["memory"].as_u64()
-                    .ok_or_else(|| anyhow!("memory missing"))?;
-                let steps = val["steps"].as_u64()
-                    .ok_or_else(|| anyhow!("steps missing"))?;
+                let mem = val["memory"].as_u64().ok_or_else(|| anyhow!("memory missing"))?;
+                let steps = val["steps"].as_u64().ok_or_else(|| anyhow!("steps missing"))?;
                 return Ok(ExUnits { mem, steps });
             }
         }
     }
-    // Try newer shape: result is an array of { validator: {purpose,index}, budget: {memory,cpu} }
     if let Some(arr) = v["result"].as_array() {
         for entry in arr {
             if entry["validator"]["purpose"].as_str() == Some("spend") {
@@ -579,26 +733,19 @@ fn parse_hash32(hex_str: &str) -> Result<Hash<32>> {
     Ok(Hash::<32>::from(arr))
 }
 
-/// Parse Blockfrost price representation. Older API returns a string like
-/// "0.0577", newer API returns a {numerator, denominator} object.
 fn parse_price(v: &serde_json::Value) -> Result<(u64, u64)> {
     if let Some(s) = v.as_str() {
-        // String form: "0.0577" -> (577, 10000)
         let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
         let denom: u64 = 10u64.pow(frac.len() as u32);
         let num: u64 = format!("{}{}", whole, frac).parse()?;
         return Ok((num, denom));
     }
     if let Some(n) = v.as_f64() {
-        // Float form: convert with millionths precision.
         let denom = 1_000_000_000u64;
         let num = (n * denom as f64).round() as u64;
         return Ok((num, denom));
     }
-    if let (Some(num), Some(denom)) = (
-        v["numerator"].as_u64(),
-        v["denominator"].as_u64(),
-    ) {
+    if let (Some(num), Some(denom)) = (v["numerator"].as_u64(), v["denominator"].as_u64()) {
         return Ok((num, denom));
     }
     bail!("could not parse price value: {:?}", v)
@@ -606,6 +753,27 @@ fn parse_price(v: &serde_json::Value) -> Result<(u64, u64)> {
 
 fn ceil_div(a: u128, b: u128) -> u128 {
     (a + b - 1) / b
+}
+
+fn token_from_unit(unit: &str) -> Result<Token> {
+    if unit == "lovelace" {
+        return Ok(Token::Lovelace);
+    }
+    if unit.len() < 56 {
+        bail!(
+            "token unit '{}' is too short (need at least 56 hex chars for policy ID)",
+            unit
+        );
+    }
+    let (policy, name) = unit.split_at(56);
+    Ok(Token::Asset(Asset::new(policy, name, 0)))
+}
+
+fn token_unit(t: &Token) -> String {
+    match t {
+        Token::Lovelace => "lovelace".to_string(),
+        Token::Asset(a) => format!("{}{}", a.policy_id, a.name_hex),
+    }
 }
 
 // ---------- config ----------
@@ -616,7 +784,10 @@ struct Config {
     sender_bech32: String,
     sender_mnemonic: String,
     sender_mnemonic_passphrase: String,
-    /// Optional pinned collateral UTxO as (tx_hash, output_index).
+    pool_lp_token_unit: String,
+    swap_in_unit: String,
+    swap_in_amount: u64,
+    limit_premium_percent: f64,
     collateral_utxo: Option<(String, u64)>,
 }
 
@@ -624,6 +795,7 @@ impl Config {
     fn from_env() -> Result<Self> {
         const REQUIRED: &[&str] = &[
             "KUPO_URL", "BLOCKFROST_PROJECT_ID", "SENDER_BECH32", "SENDER_MNEMONIC",
+            "POOL_LP_TOKEN_UNIT", "SWAP_IN_UNIT", "SWAP_IN_AMOUNT",
         ];
         let missing: Vec<&str> = REQUIRED.iter().copied()
             .filter(|k| env::var(k).is_err())
@@ -631,15 +803,26 @@ impl Config {
         if !missing.is_empty() {
             bail!("missing required env vars: {:?}", missing);
         }
+
         let kupo_url = env::var("KUPO_URL").unwrap();
         let bf_project_id = env::var("BLOCKFROST_PROJECT_ID").unwrap();
         let sender_bech32 = env::var("SENDER_BECH32").unwrap();
+
         if !sender_bech32.starts_with("addr1") {
-            bail!("SENDER_BECH32 must be mainnet (addr1...)");
+            bail!(
+                "SENDER_BECH32 must be a mainnet base address (addr1...) — \
+                 testnet/preview addresses are not supported"
+            );
         }
         if !bf_project_id.starts_with("mainnet") {
             bail!("BLOCKFROST_PROJECT_ID must start with `mainnet`");
         }
+
+        let limit_premium_percent = env::var("LIMIT_PREMIUM_PERCENT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(10.0);
+
         let collateral_utxo = env::var("COLLATERAL_UTXO").ok()
             .map(|s| {
                 let (h, i) = s.split_once('#')
@@ -657,12 +840,19 @@ impl Config {
             kupo_url, bf_project_id, sender_bech32,
             sender_mnemonic: env::var("SENDER_MNEMONIC").unwrap(),
             sender_mnemonic_passphrase: env::var("SENDER_MNEMONIC_PASSPHRASE").unwrap_or_default(),
+            pool_lp_token_unit: env::var("POOL_LP_TOKEN_UNIT").unwrap(),
+            swap_in_unit: env::var("SWAP_IN_UNIT").unwrap(),
+            swap_in_amount: env::var("SWAP_IN_AMOUNT")
+                .unwrap()
+                .parse::<u64>()
+                .context("SWAP_IN_AMOUNT must be a u64")?,
+            limit_premium_percent,
             collateral_utxo,
         })
     }
 }
 
-// ---------- key derivation (same as live_swap.rs) ----------
+// ---------- key derivation (same as live_cancel.rs) ----------
 
 fn derive_account_keys(mnemonic_phrase: &str, passphrase: &str)
     -> Result<(XPrv, XPrv, String)>

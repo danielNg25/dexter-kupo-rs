@@ -10,7 +10,7 @@ use crate::dex::minswap_v2::MinswapV2;
 use crate::dex::DexSwap;
 use crate::models::{token_identifier, LiquidityPool, Token, Utxo};
 use crate::plutus::PlutusData;
-use crate::requests::{AddressType, AssetAmount, PayToAddress, PlutusScript, PlutusVersion, SpendUtxo, SwapFee, SwapParams};
+use crate::requests::{AddressType, AssetAmount, PayToAddress, PlutusScript, PlutusVersion, SpendUtxo, SwapFee, SwapParams, UtxoRef};
 
 /// Returns `(reserve_for_token, reserve_for_other)` ordered to match `token`.
 fn corresponding_reserves(pool: &LiquidityPool, token: &Token) -> (u128, u128) {
@@ -32,6 +32,17 @@ fn fee_mods(pool_fee_percent: f64) -> (u128, u128) {
 
 /// Minswap V2 order script hash — payment credential of every V2 order address.
 pub const ORDER_SCRIPT_HASH: &str = "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c";
+/// The on-chain UTxO that holds the Minswap V2 order script as its
+/// reference_script. Mainnet only. Discovered from tx
+/// `ddb038fae5556b564b04e9dcf6139415d8be3b2e45a4e8c8eba29df79e47d169`.
+pub const ORDER_SCRIPT_REF_UTXO_TX: &str =
+    "cf4ecddde0d81f9ce8fcc881a85eb1f8ccdaf6807f03fea4cd02da896a621776";
+/// Output index of [`ORDER_SCRIPT_REF_UTXO_TX`].
+pub const ORDER_SCRIPT_REF_UTXO_INDEX: u64 = 0;
+/// Size of the on-chain Minswap V2 order script in bytes. Used by executors
+/// to compute the Conway-era reference-script fee
+/// (`script_size_bytes * min_fee_ref_script_cost_per_byte`).
+pub const ORDER_SCRIPT_SIZE_BYTES: u64 = 2659;
 /// LP token policy id (also the pool validity-asset policy).
 pub const LP_TOKEN_POLICY_ID: &str = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
 /// Cancel redeemer — Constr(1,[]) (`unit`), per dexter's `cancelDatum`.
@@ -272,6 +283,12 @@ impl DexSwap for MinswapV2 {
                     version: PlutusVersion::V2,
                     cbor_hex: ORDER_SCRIPT_CBOR_HEX.to_string(),
                 }),
+                validator_reference: Some(UtxoRef {
+                    tx_hash: ORDER_SCRIPT_REF_UTXO_TX.to_string(),
+                    output_index: ORDER_SCRIPT_REF_UTXO_INDEX,
+                    script_hash: ORDER_SCRIPT_HASH.to_string(),
+                    script_size_bytes: ORDER_SCRIPT_SIZE_BYTES,
+                }),
                 signer: Some(return_address.to_string()),
             }],
         }])
@@ -281,7 +298,10 @@ impl DexSwap for MinswapV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address::decode_base_address;
+    use crate::dex::swap::DexSwap;
     use crate::models::{Asset, LiquidityPool, Token};
+    use crate::requests::types::{OrderKind, SwapParams};
 
     fn ada_token_pool(reserve_ada: u64, reserve_token: u64, fee_pct: f64) -> LiquidityPool {
         LiquidityPool {
@@ -380,6 +400,14 @@ mod tests {
         assert_eq!(v.version, PlutusVersion::V2);
         assert_eq!(v.cbor_hex, ORDER_SCRIPT_CBOR_HEX);
         assert_eq!(s.signer.as_deref(), Some(unrelated.as_str()));
+        assert_eq!(
+            s.validator_reference.as_ref().map(|r| (r.tx_hash.as_str(), r.output_index)),
+            Some(("cf4ecddde0d81f9ce8fcc881a85eb1f8ccdaf6807f03fea4cd02da896a621776", 0))
+        );
+        assert_eq!(
+            s.validator_reference.as_ref().map(|r| r.script_hash.as_str()),
+            Some(ORDER_SCRIPT_HASH)
+        );
     }
 
     #[test]
@@ -399,5 +427,61 @@ mod tests {
             datum_type: None,
         };
         assert!(dex().build_cancel_order(&[other], &unrelated).is_err());
+    }
+
+    #[test]
+    fn build_update_order_combines_cancel_spend_with_new_swap_output() {
+        let dex = dex();
+        let pool = ada_token_pool(1_000_000_000_000, 5_000_000_000_000, 0.3);
+
+        // A real mainnet base address for sender/receiver (same as SENDER_ADDR in address tests).
+        let sender_bech32 = "addr1qyfd4vf3pwalnfxucjut2xx653s9ukguwnlrnjjq4qvld76r7sjjnw3fd7elhw73fqtcjae3yxd9xwwn2x265mnadv3qyun95l";
+        let sender = decode_base_address(sender_bech32).expect("decode sender");
+
+        // Old order UTxO — at the V2 order script address.
+        let old_order_address = "addr1z8p79rpkcdz8x9d6tft0x0dx5mwuzac2sa4gm8cvkw5hcnzr7sjjnw3fd7elhw73fqtcjae3yxd9xwwn2x265mnadv3qhj56am";
+        let old_order = crate::models::Utxo {
+            address: old_order_address.into(),
+            tx_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            tx_index: 0,
+            output_index: 0,
+            amount: vec![crate::models::Unit { unit: "lovelace".into(), quantity: "5000000".into() }],
+            block: String::new(),
+            data_hash: None,
+            inline_datum: None,
+            reference_script_hash: None,
+            datum_type: None,
+        };
+
+        let swap_out_token = match &pool.asset_b {
+            Token::Asset(a) => Token::Asset(a.clone()),
+            _ => unreachable!(),
+        };
+        let params = SwapParams {
+            sender: sender.clone(),
+            receiver: sender.clone(),
+            swap_in_token: Token::Lovelace,
+            swap_out_token,
+            swap_in_amount: 100_000_000,
+            min_receive: 400_000_000,
+            kind: OrderKind::Market,
+            kill_on_failed: false,
+            spend_utxos: vec![],
+        };
+
+        let pays = dex.build_update_order(&pool, &[old_order.clone()], &params).expect("update build");
+        assert_eq!(pays.len(), 1);
+        let p = &pays[0];
+
+        // New order side: pays to script address with a datum.
+        assert!(p.datum.is_some(), "new order datum must be present");
+        assert!(p.assets.iter().any(|a| a.unit == "lovelace"));
+
+        // Cancel side: spend_utxos contains the old order with cancel redeemer + ref script.
+        assert_eq!(p.spend_utxos.len(), 1);
+        let s = &p.spend_utxos[0];
+        assert_eq!(s.utxo.tx_hash, old_order.tx_hash);
+        assert_eq!(s.redeemer.as_deref(), Some(CANCEL_REDEEMER));
+        assert!(s.validator_reference.is_some());
     }
 }

@@ -108,8 +108,9 @@ impl<'a, D: DexSwap + ?Sized> SwapRequest<'a, D> {
         Ok(self.dex.price_impact_percent(pool, in_token, self.swap_in_amount))
     }
 
-    /// Build the payment instructions.
-    pub fn build(self) -> Result<Vec<PayToAddress>> {
+    /// Validate inputs and assemble `(dex, pool, params)`. Used internally by
+    /// `build()` and by `UpdateSwapRequest::build()`.
+    pub(crate) fn into_dex_pool_params(self) -> Result<(&'a D, LiquidityPool, SwapParams)> {
         let pool = self.pool.clone().ok_or_else(|| anyhow!("pool not set"))?;
         let in_token = self.swap_in_token.clone().ok_or_else(|| anyhow!("swap_in_token not set"))?;
         if self.swap_in_amount == 0 {
@@ -153,6 +154,12 @@ impl<'a, D: DexSwap + ?Sized> SwapRequest<'a, D> {
             kill_on_failed: self.kill_on_failed,
             spend_utxos: self.spend_utxos,
         };
-        self.dex.build_swap_order(&pool, &params)
+        Ok((self.dex, pool, params))
+    }
+
+    /// Build the payment instructions.
+    pub fn build(self) -> Result<Vec<PayToAddress>> {
+        let (dex, pool, params) = self.into_dex_pool_params()?;
+        dex.build_swap_order(&pool, &params)
     }
 }
