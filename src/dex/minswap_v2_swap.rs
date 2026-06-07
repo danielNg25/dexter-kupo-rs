@@ -420,4 +420,64 @@ mod tests {
         };
         assert!(dex().build_cancel_order(&[other], &unrelated).is_err());
     }
+
+    #[test]
+    fn build_update_order_combines_cancel_spend_with_new_swap_output() {
+        use crate::address::decode_base_address;
+        use crate::dex::swap::DexSwap;
+        use crate::requests::types::{OrderKind, SwapParams};
+
+        let dex = dex();
+        let pool = ada_token_pool(1_000_000_000_000, 5_000_000_000_000, 0.3);
+
+        // A real mainnet base address for sender/receiver (same as SENDER_ADDR in address tests).
+        let sender_bech32 = "addr1qyfd4vf3pwalnfxucjut2xx653s9ukguwnlrnjjq4qvld76r7sjjnw3fd7elhw73fqtcjae3yxd9xwwn2x265mnadv3qyun95l";
+        let sender = decode_base_address(sender_bech32).expect("decode sender");
+
+        // Old order UTxO — at the V2 order script address.
+        let old_order_address = "addr1z8p79rpkcdz8x9d6tft0x0dx5mwuzac2sa4gm8cvkw5hcnzr7sjjnw3fd7elhw73fqtcjae3yxd9xwwn2x265mnadv3qhj56am";
+        let old_order = crate::models::Utxo {
+            address: old_order_address.into(),
+            tx_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            tx_index: 0,
+            output_index: 0,
+            amount: vec![crate::models::Unit { unit: "lovelace".into(), quantity: "5000000".into() }],
+            block: String::new(),
+            data_hash: None,
+            inline_datum: None,
+            reference_script_hash: None,
+            datum_type: None,
+        };
+
+        let swap_out_token = match &pool.asset_b {
+            Token::Asset(a) => Token::Asset(a.clone()),
+            _ => unreachable!(),
+        };
+        let params = SwapParams {
+            sender: sender.clone(),
+            receiver: sender.clone(),
+            swap_in_token: Token::Lovelace,
+            swap_out_token,
+            swap_in_amount: 100_000_000,
+            min_receive: 400_000_000,
+            kind: OrderKind::Market,
+            kill_on_failed: false,
+            spend_utxos: vec![],
+        };
+
+        let pays = dex.build_update_order(&pool, &[old_order.clone()], &params).expect("update build");
+        assert_eq!(pays.len(), 1);
+        let p = &pays[0];
+
+        // New order side: pays to script address with a datum.
+        assert!(p.datum.is_some(), "new order datum must be present");
+        assert!(p.assets.iter().any(|a| a.unit == "lovelace"));
+
+        // Cancel side: spend_utxos contains the old order with cancel redeemer + ref script.
+        assert_eq!(p.spend_utxos.len(), 1);
+        let s = &p.spend_utxos[0];
+        assert_eq!(s.utxo.tx_hash, old_order.tx_hash);
+        assert_eq!(s.redeemer.as_deref(), Some(CANCEL_REDEEMER));
+        assert!(s.validator_reference.is_some());
+    }
 }

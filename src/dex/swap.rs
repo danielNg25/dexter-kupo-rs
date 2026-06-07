@@ -27,4 +27,27 @@ pub trait DexSwap: Send + Sync {
         order_utxos: &[Utxo],
         return_address: &str,
     ) -> Result<Vec<PayToAddress>>;
+
+    /// Build a single-tx update of an existing order: spend the old order with
+    /// the cancel redeemer AND create a new order at the same script address
+    /// with `new_swap_params`. Default impl composes `build_swap_order` and
+    /// `build_cancel_order`. DEXes whose "update" needs custom redeemer logic
+    /// can override this method.
+    fn build_update_order(
+        &self,
+        pool: &LiquidityPool,
+        old_order_utxos: &[Utxo],
+        new_swap_params: &SwapParams,
+    ) -> Result<Vec<PayToAddress>> {
+        let mut new_order = self.build_swap_order(pool, new_swap_params)?;
+        let cancel = self.build_cancel_order(old_order_utxos, &new_swap_params.sender.bech32)?;
+        if new_order.is_empty() {
+            anyhow::bail!("build_swap_order returned empty PayToAddress list");
+        }
+        if cancel.is_empty() || cancel[0].spend_utxos.is_empty() {
+            anyhow::bail!("build_cancel_order returned no spend_utxos");
+        }
+        new_order[0].spend_utxos = cancel[0].spend_utxos.clone();
+        Ok(new_order)
+    }
 }
