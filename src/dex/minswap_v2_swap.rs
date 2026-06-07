@@ -272,6 +272,7 @@ impl DexSwap for MinswapV2 {
                     version: PlutusVersion::V2,
                     cbor_hex: ORDER_SCRIPT_CBOR_HEX.to_string(),
                 }),
+                validator_reference: None,
                 signer: Some(return_address.to_string()),
             }],
         }])

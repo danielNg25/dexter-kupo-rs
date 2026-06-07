@@ -38,12 +38,30 @@ pub struct PlutusScript {
     pub cbor_hex: String,
 }
 
+/// On-chain reference to a UTxO that carries a Plutus script as its
+/// reference_script (CIP-33). The executor can attach this UTxO as a
+/// `reference_input` instead of including the script bytes in the witness set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UtxoRef {
+    pub tx_hash: String,
+    pub output_index: u64,
+    /// The Blake2b-224 hash of the script at this UTxO. The executor verifies
+    /// the reference matches before using it.
+    pub script_hash: String,
+}
+
 /// A UTxO the order intends to spend (input).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpendUtxo {
     pub utxo: Utxo,
     pub redeemer: Option<String>,         // CBOR hex
+    /// Inline validator (full script CBOR). Use this when no reference UTxO
+    /// is available. Either `validator` or `validator_reference` should be
+    /// populated; if both are Some, executors should prefer `validator_reference`.
     pub validator: Option<PlutusScript>,
+    /// On-chain script reference (CIP-33). When Some, executors should attach
+    /// this UTxO as a `reference_input` and skip the inline script.
+    pub validator_reference: Option<UtxoRef>,
     pub signer: Option<String>,
 }
 
@@ -81,4 +99,45 @@ pub struct SwapParams {
     pub kind: OrderKind,
     pub kill_on_failed: bool,
     pub spend_utxos: Vec<Utxo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Unit;
+
+    #[test]
+    fn utxo_ref_serializes_with_all_fields() {
+        let r = UtxoRef {
+            tx_hash: "cf4ecddde0d81f9ce8fcc881a85eb1f8ccdaf6807f03fea4cd02da896a621776".into(),
+            output_index: 0,
+            script_hash: "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c".into(),
+        };
+        assert_eq!(r.tx_hash.len(), 64);
+        assert_eq!(r.output_index, 0);
+        assert_eq!(r.script_hash.len(), 56);
+    }
+
+    #[test]
+    fn spend_utxo_validator_reference_defaults_to_none() {
+        let s = SpendUtxo {
+            utxo: crate::models::Utxo {
+                address: String::new(),
+                tx_hash: String::new(),
+                tx_index: 0,
+                output_index: 0,
+                amount: vec![Unit { unit: "lovelace".into(), quantity: "0".into() }],
+                block: String::new(),
+                data_hash: None,
+                inline_datum: None,
+                reference_script_hash: None,
+                datum_type: None,
+            },
+            redeemer: None,
+            validator: None,
+            validator_reference: None,
+            signer: None,
+        };
+        assert!(s.validator_reference.is_none());
+    }
 }
