@@ -309,9 +309,13 @@ async fn main() -> Result<()> {
         .context("fetching wallet UTxOs from Kupo")?;
     eprintln!("kupo returned {} UTxO(s) at sender", wallet_utxos.len());
 
-    if let Some((c_tx, c_idx)) = &cfg.collateral_utxo {
-        eprintln!("✓ reserving COLLATERAL_UTXO {}#{} from fee coin selection", c_tx, c_idx);
-    }
+    // The chosen collateral UTxO (pinned or auto-picked) must NOT also be used
+    // as a regular fee input — the Cardano ledger rejects a tx that lists the
+    // same UTxO in both `inputs` and `collateral_inputs`.
+    let collateral_ref: (String, u64) =
+        (collateral.0.tx_hash.clone(), collateral.0.output_index as u64);
+    eprintln!("✓ reserving collateral UTxO {}#{} from fee coin selection",
+        collateral_ref.0, collateral_ref.1);
 
     // Fee: taken from wallet input (pure-ADA), NOT from the new order's lovelace.
     // This keeps new_order_lovelace identical to what the library computed (5 ADA).
@@ -324,11 +328,10 @@ async fn main() -> Result<()> {
         if u.amount.len() != 1 || u.amount[0].unit != "lovelace" {
             continue;
         }
-        // Exclude pinned collateral from fee selection.
-        if let Some((c_tx, c_idx)) = &cfg.collateral_utxo {
-            if u.tx_hash == *c_tx && u.output_index as u64 == *c_idx {
-                continue;
-            }
+        // Exclude the collateral UTxO (covers both pinned + auto modes since
+        // collateral_ref always reflects whichever UTxO was actually chosen).
+        if u.tx_hash == collateral_ref.0 && u.output_index as u64 == collateral_ref.1 {
+            continue;
         }
         let qty: u64 = u.amount[0].quantity.parse().unwrap_or(0);
         fee_utxo_candidates.push((u.tx_hash.clone(), u.output_index as u64, qty));
@@ -412,7 +415,6 @@ async fn main() -> Result<()> {
         order_script_input.clone(),
         fee_wallet_input.clone(),
         collateral_input.clone(),
-        &old_order_utxo,
         new_order_addr.clone(),
         new_order_lovelace,
         &new_order_extra_assets,
@@ -462,7 +464,6 @@ async fn main() -> Result<()> {
             order_script_input.clone(),
             fee_wallet_input.clone(),
             collateral_input.clone(),
-            &old_order_utxo,
             new_order_addr.clone(),
             new_order_lovelace,
             &new_order_extra_assets,
@@ -567,7 +568,6 @@ fn build_update_tx(
     order_input: Input,
     wallet_input: Input,
     collateral_input: Input,
-    _old_order_utxo: &dexter_kupo_rs::models::Utxo,
     new_order_addr: PallasAddress,
     new_order_lovelace: u64,
     new_order_extra_assets: &[(String, u64)],
@@ -583,6 +583,13 @@ fn build_update_tx(
     fee: u64,
     ttl: u64,
 ) -> Result<StagingTransaction> {
+    // Note: the old order's extra native tokens (if any) are NOT returned to
+    // the sender in the update tx — they are consumed into the new order via
+    // `new_order_extra_assets`. For Minswap V2 ADA→TOKEN and TOKEN→ADA orders
+    // the order UTxO is always pure-ADA or holds exactly the swap-in token,
+    // both of which are accounted for above. To handle exotic cases (e.g.,
+    // surplus native tokens), pass through the old order's amount list and
+    // emit a separate return output here.
     // Build the new order output with inline datum.
     let mut new_order_out = Output::new(new_order_addr, new_order_lovelace)
         .set_inline_datum(datum_bytes);
@@ -599,14 +606,6 @@ fn build_update_tx(
             .add_asset(Hash::<28>::from(policy), name, *qty)
             .map_err(|e| anyhow!("add_asset to new order: {:?}", e))?;
     }
-
-    // The old order's non-lovelace assets (if any) are NOT returned to the sender
-    // in the update tx: they are consumed by the new order. But if the old order
-    // had additional native tokens that are NOT part of the new swap, they need
-    // to be returned via the change output. For Minswap V2 ADA→TOKEN and
-    // TOKEN→ADA orders the order UTxO is always pure-ADA or holds exactly the
-    // swap-in token — both of which are accounted for above. If you need to
-    // handle more complex cases, extend this section.
 
     // Change output: wallet_input lovelace minus fee.
     let change_out = Output::new(sender_addr, change_lovelace);
