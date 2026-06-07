@@ -51,3 +51,7 @@ path = "examples/live_swap.rs"
 [[example]]
 name = "live_cancel"
 path = "examples/live_cancel.rs"
+
+[[example]]
+name = "live_update"
+path = "examples/live_update.rs"
