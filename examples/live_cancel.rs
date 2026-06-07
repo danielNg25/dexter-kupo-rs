@@ -152,6 +152,29 @@ async fn main() -> Result<()> {
     eprintln!("✓ cancel built: script {} bytes, redeemer {} bytes",
         script_cbor.len(), redeemer_cbor.len());
 
+    // Prefer validator_reference (reference script UTxO) when the library provides it.
+    // On mainnet Minswap V2, this is the published UTxO that carries the 2659-byte script,
+    // saving it from the witness set: tx size drops from ~3.8KB to ~1KB.
+    let validator_reference: Option<Input> = if let Some(r) = &spend.validator_reference {
+        let tx_hash_arr: [u8; 32] = hex::decode(&r.tx_hash)
+            .context("decoding validator_reference tx_hash hex")?
+            .try_into()
+            .map_err(|_| anyhow!("validator_reference tx_hash is not 32 bytes"))?;
+        Some(Input::new(
+            pallas_crypto::hash::Hash::<32>::from(tx_hash_arr),
+            r.output_index,
+        ))
+    } else {
+        None
+    };
+    if validator_reference.is_some() {
+        eprintln!("✓ using reference script UTxO {}#{} (saves ~2.6KB in tx witness set)",
+            spend.validator_reference.as_ref().unwrap().tx_hash,
+            spend.validator_reference.as_ref().unwrap().output_index);
+    } else {
+        eprintln!("⚠ no validator_reference; using inline script (2.6KB in witness set)");
+    }
+
     // 3. Resolve the collateral UTxO.
     //    Required size = collateral_percent (150%) × tx_fee (~0.5 ADA) = ~0.75 ADA,
     //    plus Cardano's min-UTxO floor (~1 ADA). 2 ADA is enough headroom.
@@ -274,6 +297,7 @@ async fn main() -> Result<()> {
         return_addr.clone(),
         return_lovelace,
         &script_cbor,
+        validator_reference.clone(),
         &redeemer_cbor,
         placeholder_ex,
         Hash::<28>::from(payment_pkh),
@@ -318,6 +342,7 @@ async fn main() -> Result<()> {
             return_addr.clone(),
             return_lovelace,
             &script_cbor,
+            validator_reference.clone(),
             &redeemer_cbor,
             real_ex.clone(),
             Hash::<28>::from(payment_pkh),
@@ -404,6 +429,7 @@ fn build_cancel_tx(
     return_addr: PallasAddress,
     return_lovelace: u64,
     script_cbor: &[u8],
+    validator_reference: Option<Input>,
     redeemer_cbor: &[u8],
     ex_units: ExUnits,
     payment_pkh: Hash<28>,
@@ -436,11 +462,16 @@ fn build_cancel_tx(
     language_map.insert(1u8, plutus_v2_cost_model);
     let language_views = LanguageViews(language_map);
 
-    let tx = StagingTransaction::new()
+    let mut tx = StagingTransaction::new()
         .input(order_input.clone())
         .collateral_input(collateral_input)
-        .output(out)
-        .script(ScriptKind::PlutusV2, script_cbor.to_vec())
+        .output(out);
+    if let Some(ref_input) = validator_reference {
+        tx = tx.reference_input(ref_input);
+    } else {
+        tx = tx.script(ScriptKind::PlutusV2, script_cbor.to_vec());
+    }
+    let tx = tx
         .add_spend_redeemer(order_input, redeemer_cbor.to_vec(), Some(ex_units))
         .disclosed_signer(payment_pkh)
         .language_views(language_views)
