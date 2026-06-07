@@ -39,6 +39,10 @@ pub const ORDER_SCRIPT_REF_UTXO_TX: &str =
     "cf4ecddde0d81f9ce8fcc881a85eb1f8ccdaf6807f03fea4cd02da896a621776";
 /// Output index of [`ORDER_SCRIPT_REF_UTXO_TX`].
 pub const ORDER_SCRIPT_REF_UTXO_INDEX: u64 = 0;
+/// Size of the on-chain Minswap V2 order script in bytes. Used by executors
+/// to compute the Conway-era reference-script fee
+/// (`script_size_bytes * min_fee_ref_script_cost_per_byte`).
+pub const ORDER_SCRIPT_SIZE_BYTES: u64 = 2659;
 /// LP token policy id (also the pool validity-asset policy).
 pub const LP_TOKEN_POLICY_ID: &str = "f5808c2c990d86da54bfc97d89cee6efa20cd8461616359478d96b4c";
 /// Cancel redeemer — Constr(1,[]) (`unit`), per dexter's `cancelDatum`.
@@ -283,6 +287,7 @@ impl DexSwap for MinswapV2 {
                     tx_hash: ORDER_SCRIPT_REF_UTXO_TX.to_string(),
                     output_index: ORDER_SCRIPT_REF_UTXO_INDEX,
                     script_hash: ORDER_SCRIPT_HASH.to_string(),
+                    script_size_bytes: ORDER_SCRIPT_SIZE_BYTES,
                 }),
                 signer: Some(return_address.to_string()),
             }],

@@ -365,6 +365,15 @@ async fn main() -> Result<()> {
     let price_mem = parse_price(&params["price_mem"]).context("parsing price_mem")?;
     let price_step = parse_price(&params["price_step"]).context("parsing price_step")?;
     let collateral_percent = params["collateral_percent"].as_u64().unwrap_or(150);
+    // Conway-era reference-script fee: per-byte cost charged for every byte of
+    // reference script attached to the tx. For our single sub-25.6KB script,
+    // ref_script_fee = script_size_bytes * coins_per_byte (no tiering needed).
+    let ref_script_cost_per_byte: f64 = params["min_fee_ref_script_cost_per_byte"]
+        .as_f64()
+        .or_else(|| params["min_fee_ref_script_cost_per_byte"].as_str().and_then(|s| s.parse().ok()))
+        .or_else(|| params["min_fee_ref_script_coins_per_byte"].as_f64())
+        .or_else(|| params["min_fee_ref_script_coins_per_byte"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(15.0);
     let cost_v2: Vec<i64> = if let Some(arr) = params["cost_models_raw"]["PlutusV2"].as_array() {
         arr.iter()
             .map(|v| v.as_i64().ok_or_else(|| anyhow!("cost_models_raw entry not i64")))
@@ -380,8 +389,8 @@ async fn main() -> Result<()> {
             params.as_object().map(|m| m.keys().collect::<Vec<_>>())
         );
     };
-    eprintln!("protocol: a={} b={} price_mem={}/{} price_step={}/{} v2_cost_entries={}",
-        min_fee_a, min_fee_b, price_mem.0, price_mem.1, price_step.0, price_step.1, cost_v2.len());
+    eprintln!("protocol: a={} b={} price_mem={}/{} price_step={}/{} ref_script_per_byte={} v2_cost_entries={}",
+        min_fee_a, min_fee_b, price_mem.0, price_mem.1, price_step.0, price_step.1, ref_script_cost_per_byte, cost_v2.len());
 
     let current_slot = kupo.tip_slot().await.context("tip slot")?;
     let ttl = current_slot + 7200;
@@ -442,7 +451,13 @@ async fn main() -> Result<()> {
     let script_fee = ceil_div(real_ex.mem as u128 * price_mem.0 as u128, price_mem.1 as u128)
         + ceil_div(real_ex.steps as u128 * price_step.0 as u128, price_step.1 as u128);
     let script_fee = script_fee as u64;
-    eprintln!("script fee: {} lovelace", script_fee);
+    // Conway-era ref-script fee: charged per byte of any reference script
+    // attached via reference_input. Only applies when validator_reference is in use.
+    let ref_script_fee: u64 = match &spend.validator_reference {
+        Some(r) => (r.script_size_bytes as f64 * ref_script_cost_per_byte).ceil() as u64,
+        None => 0,
+    };
+    eprintln!("script fee: {} lovelace; ref_script fee: {} lovelace", script_fee, ref_script_fee);
 
     const VKEY_WITNESS_OVERHEAD: u64 = 220;
     const FEE_SAFETY: u64 = 500;
@@ -483,10 +498,10 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow!("build pass {}: {:?}", iter, e))?;
         let signed_size = raw.tx_bytes.0.len() as u64 + VKEY_WITNESS_OVERHEAD;
         let tx_fee = min_fee_b + min_fee_a * signed_size;
-        let required = tx_fee + script_fee + FEE_SAFETY;
+        let required = tx_fee + script_fee + ref_script_fee + FEE_SAFETY;
         eprintln!(
-            "fee iter {}: estimate={} tx_fee={} script_fee={} required={} size~{}",
-            iter, fee_estimate, tx_fee, script_fee, required, signed_size
+            "fee iter {}: estimate={} tx_fee={} script_fee={} ref_script={} required={} size~{}",
+            iter, fee_estimate, tx_fee, script_fee, ref_script_fee, required, signed_size
         );
         if fee_estimate >= required {
             built = Some(raw);

@@ -48,6 +48,11 @@ pub struct UtxoRef {
     /// The Blake2b-224 hash of the script at this UTxO. The executor verifies
     /// the reference matches before using it.
     pub script_hash: String,
+    /// Size of the referenced script in bytes. Conway era charges a per-byte
+    /// fee for reference scripts (`min_fee_ref_script_cost_per_byte`); the
+    /// executor multiplies this size by the protocol-param coins-per-byte
+    /// to compute the ref-script fee component.
+    pub script_size_bytes: u64,
 }
 
 /// A UTxO the order intends to spend (input).
@@ -111,6 +116,7 @@ mod tests {
             tx_hash: "cf4ecddde0d81f9ce8fcc881a85eb1f8ccdaf6807f03fea4cd02da896a621776".into(),
             output_index: 0,
             script_hash: "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c".into(),
+            script_size_bytes: 2659,
         };
         let json = serde_json::to_string(&r).expect("serialize");
         let back: UtxoRef = serde_json::from_str(&json).expect("deserialize");
@@ -138,6 +144,7 @@ mod tests {
                 tx_hash: "cf4ecddde0d81f9ce8fcc881a85eb1f8ccdaf6807f03fea4cd02da896a621776".into(),
                 output_index: 0,
                 script_hash: "c3e28c36c3447315ba5a56f33da6a6ddc1770a876a8d9f0cb3a97c4c".into(),
+                script_size_bytes: 2659,
             }),
             signer: Some("addr1".into()),
         };
