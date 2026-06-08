@@ -35,7 +35,7 @@ pub trait DexSwap: Send + Sync {
     /// `new_orders`. Updates produce one cancel-half + one place-half.
     fn build_bulk_orders(
         &self,
-        pool: &crate::models::LiquidityPool,
+        pool: Option<&crate::models::LiquidityPool>,
         cancels: &[crate::models::Utxo],
         swaps: &[crate::requests::types::SwapParams],
         updates: &[(crate::models::Utxo, crate::requests::types::SwapParams)],
@@ -45,6 +45,14 @@ pub trait DexSwap: Send + Sync {
 
         let mut all_cancels: Vec<crate::requests::types::SpendUtxo> = Vec::new();
         let mut all_new_orders: Vec<crate::requests::types::PayToAddress> = Vec::new();
+
+        // Resolve pool once for the swap/update paths. Pure-cancel bundles
+        // never reach the loops below, so missing-pool there is fine.
+        let pool_for_swaps = || -> anyhow::Result<&crate::models::LiquidityPool> {
+            pool.ok_or_else(|| anyhow!(
+                "build_bulk_orders: pool is required when the bundle has at least one swap or update"
+            ))
+        };
 
         // Pure cancels
         for utxo in cancels {
@@ -64,7 +72,7 @@ pub trait DexSwap: Send + Sync {
 
         // Pure swaps
         for swap in swaps {
-            let pays = self.build_swap_order(pool, swap)?;
+            let pays = self.build_swap_order(pool_for_swaps()?, swap)?;
             if pays.is_empty() {
                 anyhow::bail!("build_swap_order returned empty list for a bulk swap item");
             }
@@ -95,7 +103,7 @@ pub trait DexSwap: Send + Sync {
                 }
             }
             // Place half
-            let pays = self.build_swap_order(pool, new_params)?;
+            let pays = self.build_swap_order(pool_for_swaps()?, new_params)?;
             if pays.is_empty() {
                 anyhow::bail!("build_swap_order returned empty list for a bulk update item");
             }

@@ -28,16 +28,32 @@ fn missing_return_address_errors() {
 }
 
 #[test]
-fn missing_pool_errors() {
+fn missing_pool_errors_when_bundle_has_swap() {
+    // pool is required only when the bundle contains a swap or an update.
+    // A pure-cancel bundle WITHOUT a pool is valid; one with a swap is not.
     let dex = MinswapV2::new(KupoApi::new("http://localhost:1442"));
-    // Skip for_pool entirely.
     let err = BulkSwapRequest::new(&dex)
+        .with_return_address("addr1q8n0za95rmvwt45mvxc6lpedh5wx0jl9pyuyfufgzslfdg7tkywsce2nu7xc2pukfsl08x9wlmlnka59c5xcxjamsgfsnyaqug")
+        .expect("addr")
+        .add_swap(crate_test::test_swap_params())
+        .build()
+        .map(|_| ())
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("pool not set"),
+            "expected pool-not-set error, got: {err:#}");
+}
+
+#[test]
+fn pure_cancel_bundle_does_not_require_pool() {
+    let dex = MinswapV2::new(KupoApi::new("http://localhost:1442"));
+    let plan = BulkSwapRequest::new(&dex)
         .with_return_address("addr1q8n0za95rmvwt45mvxc6lpedh5wx0jl9pyuyfufgzslfdg7tkywsce2nu7xc2pukfsl08x9wlmlnka59c5xcxjamsgfsnyaqug")
         .expect("addr")
         .add_cancel(crate_test::synthetic_order_utxo())
         .build()
-        .unwrap_err();
-    assert!(format!("{err:#}").contains("pool not set"));
+        .expect("pure-cancel bundle should build without a pool");
+    assert_eq!(plan.cancels.len(), 1);
+    assert_eq!(plan.new_orders.len(), 0);
 }
 
 #[test]

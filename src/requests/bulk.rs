@@ -60,13 +60,25 @@ impl<'a, D: DexSwap + ?Sized> BulkSwapRequest<'a, D> {
     }
 
     pub fn build(self) -> Result<BulkOrderPlan> {
-        let pool = self.pool
-            .ok_or_else(|| anyhow!("BulkSwapRequest: pool not set (call for_pool)"))?;
         let return_address = self.return_address
             .ok_or_else(|| anyhow!("BulkSwapRequest: return_address not set"))?;
         if self.cancels.is_empty() && self.swaps.is_empty() && self.updates.is_empty() {
             return Err(anyhow!("BulkSwapRequest: empty bundle (need at least one action)"));
         }
-        self.dex.build_bulk_orders(&pool, &self.cancels, &self.swaps, &self.updates, &return_address)
+        // `pool` is required ONLY when the bundle has at least one new order
+        // (swap or update). Pure-cancel-only bundles don't need a pool.
+        let needs_pool = !self.swaps.is_empty() || !self.updates.is_empty();
+        if needs_pool && self.pool.is_none() {
+            return Err(anyhow!(
+                "BulkSwapRequest: pool not set (call for_pool) — required because the bundle has at least one swap or update"
+            ));
+        }
+        self.dex.build_bulk_orders(
+            self.pool.as_ref(),
+            &self.cancels,
+            &self.swaps,
+            &self.updates,
+            &return_address,
+        )
     }
 }
