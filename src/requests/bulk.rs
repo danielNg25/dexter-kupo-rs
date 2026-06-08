@@ -7,7 +7,7 @@
 use anyhow::{anyhow, Result};
 
 use crate::dex::DexSwap;
-use crate::models::Utxo;
+use crate::models::{LiquidityPool, Utxo};
 use crate::requests::types::{PayToAddress, SpendUtxo, SwapParams};
 
 /// What the bulk builder hands back. Flat from the caller's perspective:
@@ -22,6 +22,7 @@ pub struct BulkOrderPlan {
 
 pub struct BulkSwapRequest<'a, D: DexSwap + ?Sized> {
     dex: &'a D,
+    pool: Option<LiquidityPool>,
     return_address: Option<String>,
     cancels: Vec<Utxo>,
     swaps: Vec<SwapParams>,
@@ -30,7 +31,12 @@ pub struct BulkSwapRequest<'a, D: DexSwap + ?Sized> {
 
 impl<'a, D: DexSwap + ?Sized> BulkSwapRequest<'a, D> {
     pub fn new(dex: &'a D) -> Self {
-        Self { dex, return_address: None, cancels: vec![], swaps: vec![], updates: vec![] }
+        Self { dex, pool: None, return_address: None, cancels: vec![], swaps: vec![], updates: vec![] }
+    }
+
+    pub fn for_pool(mut self, pool: LiquidityPool) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     pub fn with_return_address(mut self, addr: &str) -> Result<Self> {
@@ -54,11 +60,13 @@ impl<'a, D: DexSwap + ?Sized> BulkSwapRequest<'a, D> {
     }
 
     pub fn build(self) -> Result<BulkOrderPlan> {
+        let pool = self.pool
+            .ok_or_else(|| anyhow!("BulkSwapRequest: pool not set (call for_pool)"))?;
         let return_address = self.return_address
             .ok_or_else(|| anyhow!("BulkSwapRequest: return_address not set"))?;
         if self.cancels.is_empty() && self.swaps.is_empty() && self.updates.is_empty() {
             return Err(anyhow!("BulkSwapRequest: empty bundle (need at least one action)"));
         }
-        self.dex.build_bulk_orders(&self.cancels, &self.swaps, &self.updates, &return_address)
+        self.dex.build_bulk_orders(&pool, &self.cancels, &self.swaps, &self.updates, &return_address)
     }
 }

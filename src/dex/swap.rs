@@ -30,16 +30,70 @@ pub trait DexSwap: Send + Sync {
 
     /// Bundle multiple order actions into a single `BulkOrderPlan`.
     ///
-    /// Default impl bails; Task 2 will replace this with a proper composition
-    /// of `build_swap_order` + `build_cancel_order` per item.
+    /// Default impl composes `build_swap_order` + `build_cancel_order` per
+    /// item and aggregates all inputs into `cancels` and all new outputs into
+    /// `new_orders`. Updates produce one cancel-half + one place-half.
     fn build_bulk_orders(
         &self,
-        _cancels: &[crate::models::Utxo],
-        _swaps: &[crate::requests::types::SwapParams],
-        _updates: &[(crate::models::Utxo, crate::requests::types::SwapParams)],
-        _return_address: &str,
+        pool: &crate::models::LiquidityPool,
+        cancels: &[crate::models::Utxo],
+        swaps: &[crate::requests::types::SwapParams],
+        updates: &[(crate::models::Utxo, crate::requests::types::SwapParams)],
+        return_address: &str,
     ) -> anyhow::Result<crate::requests::bulk::BulkOrderPlan> {
-        anyhow::bail!("DexSwap::build_bulk_orders default impl not yet wired (Task 2)")
+        use crate::requests::bulk::BulkOrderPlan;
+
+        let mut all_cancels: Vec<crate::requests::types::SpendUtxo> = Vec::new();
+        let mut all_new_orders: Vec<crate::requests::types::PayToAddress> = Vec::new();
+
+        // Pure cancels
+        for utxo in cancels {
+            let cancel_pays = self.build_cancel_order(&[utxo.clone()], return_address)?;
+            for pay in cancel_pays {
+                for spend in pay.spend_utxos {
+                    all_cancels.push(spend);
+                }
+            }
+        }
+
+        // Pure swaps
+        for swap in swaps {
+            let mut pays = self.build_swap_order(pool, swap)?;
+            if pays.is_empty() {
+                anyhow::bail!("build_swap_order returned empty list for a bulk swap item");
+            }
+            // Clear any spend_utxos — the new order is a fresh output only
+            for pay in &mut pays {
+                pay.spend_utxos.clear();
+            }
+            all_new_orders.extend(pays);
+        }
+
+        // Updates: cancel-half + place-half, kept independent in the flat lists
+        for (old_utxo, new_params) in updates {
+            // Cancel half
+            let cancel_pays = self.build_cancel_order(&[old_utxo.clone()], return_address)?;
+            for pay in cancel_pays {
+                for spend in pay.spend_utxos {
+                    all_cancels.push(spend);
+                }
+            }
+            // Place half
+            let mut pays = self.build_swap_order(pool, new_params)?;
+            if pays.is_empty() {
+                anyhow::bail!("build_swap_order returned empty list for a bulk update item");
+            }
+            for pay in &mut pays {
+                pay.spend_utxos.clear();
+            }
+            all_new_orders.extend(pays);
+        }
+
+        Ok(BulkOrderPlan {
+            cancels: all_cancels,
+            new_orders: all_new_orders,
+            return_address: return_address.to_string(),
+        })
     }
 
     /// Build a single-tx update of an existing order: spend the old order with
