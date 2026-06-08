@@ -4,11 +4,13 @@
 //! deals only in raw integers (e.g. `min_receive`); human-readable price /
 //! token decimals are the caller's responsibility.
 
+pub mod bulk;
 pub mod types;
 pub mod swap;
 pub mod cancel;
 pub mod update;
 
+pub use bulk::{BulkOrderPlan, BulkSwapRequest};
 pub use cancel::CancelSwapRequest;
 pub use swap::SwapRequest;
 pub use update::UpdateSwapRequest;

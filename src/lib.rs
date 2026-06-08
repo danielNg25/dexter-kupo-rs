@@ -106,6 +106,7 @@ pub use kupo::KupoApi;
 pub use models::{Asset, LiquidityPool, Order, OrderBook, StablePool, Token, Utxo};
 pub use plutus::PlutusData;
 pub use requests::{
-    AddressType, AssetAmount, CancelSwapRequest, OrderKind, PayToAddress, PlutusScript,
-    PlutusVersion, SpendUtxo, SwapFee, SwapParams, SwapRequest, UpdateSwapRequest,
+    AddressType, AssetAmount, BulkOrderPlan, BulkSwapRequest, CancelSwapRequest, OrderKind,
+    PayToAddress, PlutusScript, PlutusVersion, SpendUtxo, SwapFee, SwapParams, SwapRequest,
+    UpdateSwapRequest,
 };
