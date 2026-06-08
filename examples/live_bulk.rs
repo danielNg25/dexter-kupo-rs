@@ -301,17 +301,31 @@ async fn main() -> Result<()> {
 
     let plan = builder.build().context("building BulkOrderPlan")?;
 
+    // CANONICAL CANCEL ORDER:
+    // pallas-txbuilder sorts tx body inputs by (tx_hash, output_index) ascending
+    // when serializing. Blockfrost evaluate returns `spend:N` indexed by that
+    // sorted position — NOT the order the inputs were added in. To keep
+    // redeemer→ex_units mapping correct, sort the cancels once here and use
+    // `sorted_cancels` everywhere downstream (input construction, evaluate
+    // result indexing, balance math).
+    let mut sorted_cancels = plan.cancels.clone();
+    sorted_cancels.sort_by(|a, b| {
+        a.utxo.tx_hash.cmp(&b.utxo.tx_hash)
+            .then(a.utxo.output_index.cmp(&b.utxo.output_index))
+    });
+
     eprintln!("BulkOrderPlan:");
-    eprintln!("  cancels:    {}", plan.cancels.len());
+    eprintln!("  cancels:    {}", sorted_cancels.len());
     eprintln!("  new_orders: {}", plan.new_orders.len());
 
     // 4. Resolve script details from the first cancel (all share the same validator).
     //    If there are no cancels, this is a pure-place tx and we skip script setup.
+    //    Iterate sorted_cancels so redeemer order matches the tx body input order.
     let (script_cbor, validator_reference, redeemers_cbor, ref_script_size) =
-        if plan.cancels.is_empty() {
+        if sorted_cancels.is_empty() {
             (vec![], None, vec![], 0u64)
         } else {
-            let first_spend = &plan.cancels[0];
+            let first_spend = &sorted_cancels[0];
             let sc = hex::decode(
                 &first_spend.validator.as_ref()
                     .ok_or_else(|| anyhow!("cancel[0]: library missing validator"))?
@@ -332,14 +346,14 @@ async fn main() -> Result<()> {
             match &first_spend.validator_reference {
                 Some(r) => eprintln!(
                     "✓ using reference script UTxO {}#{} (saves ~2.6KB; paid ONCE for all {} cancel(s))",
-                    r.tx_hash, r.output_index, plan.cancels.len()
+                    r.tx_hash, r.output_index, sorted_cancels.len()
                 ),
                 None => eprintln!("warning: no validator_reference; using inline script (2.6KB in witness set)"),
             }
 
-            // Collect redeemer CBOR for every cancel input (in order).
+            // Collect redeemer CBOR for every cancel input, in sorted order.
             let mut redms: Vec<Vec<u8>> = Vec::new();
-            for (i, spend) in plan.cancels.iter().enumerate() {
+            for (i, spend) in sorted_cancels.iter().enumerate() {
                 let r = hex::decode(
                     spend.redeemer.as_ref()
                         .ok_or_else(|| anyhow!("cancel[{}]: missing redeemer", i))?
@@ -352,7 +366,7 @@ async fn main() -> Result<()> {
 
     // 5. Collateral UTxO.
     const MIN_COLLATERAL_LOVELACE: u64 = 2_000_000;
-    let has_script = !plan.cancels.is_empty();
+    let has_script = !sorted_cancels.is_empty();
     let collateral = if has_script {
         if let Some((c_tx, c_idx)) = &cfg.collateral_utxo {
             let pattern = format!("{}@{}", c_idx, c_tx);
@@ -453,14 +467,62 @@ async fn main() -> Result<()> {
     eprintln!();
 
     // 7. Coin selection.
-    //    Inputs  = cancel script inputs (from plan.cancels) + wallet UTxOs (fee + new order ADA)
-    //    Outputs = new order outputs (from plan.new_orders) + change
+    //    Inputs  = cancel script inputs (sorted_cancels) + wallet UTxOs (fee + new order ADA)
+    //    Outputs = new order outputs (plan.new_orders) + 1 change output
     //
-    //    Total new-order ADA = sum of lovelace across all plan.new_orders.
+    //    Balance equation:
+    //      total_wallet_selected + total_cancel_lovelace
+    //        == total_new_order_lovelace + fee + change
+    //    So change = (wallet + cancel) - new_orders - fee. We must include the
+    //    cancel-side ADA in the change calculation, otherwise every bundle with
+    //    ≥1 cancel is rejected by the ledger for unbalanced lovelace.
     let total_new_order_lovelace: u64 = plan.new_orders.iter()
         .map(|p| p.assets.iter().find(|a| a.unit == "lovelace").map(|a| a.quantity).unwrap_or(0))
         .sum();
-    eprintln!("total new-order lovelace: {} ({:.6} ADA)", total_new_order_lovelace, total_new_order_lovelace as f64 / 1_000_000.0);
+    let total_cancel_lovelace: u64 = sorted_cancels.iter()
+        .map(|s| s.utxo.amount.iter()
+            .find(|a| a.unit == "lovelace")
+            .and_then(|a| a.quantity.parse::<u64>().ok())
+            .unwrap_or(0))
+        .sum();
+    eprintln!(
+        "total new-order lovelace: {} ({:.6} ADA); total cancel-input lovelace: {} ({:.6} ADA)",
+        total_new_order_lovelace, total_new_order_lovelace as f64 / 1_000_000.0,
+        total_cancel_lovelace, total_cancel_lovelace as f64 / 1_000_000.0
+    );
+
+    // Token balance from cancel inputs minus tokens going into new-order outputs.
+    // Whatever's left over must be attached to the change output (otherwise the
+    // ledger rejects: tokens consumed but not produced).
+    let mut change_tokens: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    for spend in &sorted_cancels {
+        for unit in &spend.utxo.amount {
+            if unit.unit == "lovelace" {
+                continue;
+            }
+            let qty: u64 = unit.quantity.parse().unwrap_or(0);
+            *change_tokens.entry(unit.unit.clone()).or_insert(0) += qty;
+        }
+    }
+    // Subtract tokens carried into new orders (e.g., token-side of swap-in for token→ADA sells).
+    for p in &plan.new_orders {
+        for asset in &p.assets {
+            if asset.unit == "lovelace" {
+                continue;
+            }
+            let entry = change_tokens.entry(asset.unit.clone()).or_insert(0);
+            *entry = entry.saturating_sub(asset.quantity);
+        }
+    }
+    // Drop zero-quantity entries — empty asset attachments would be malformed.
+    change_tokens.retain(|_, q| *q > 0);
+    if !change_tokens.is_empty() {
+        eprintln!("change tokens (from cancel inputs, net of new-order tokens):");
+        for (unit, qty) in &change_tokens {
+            eprintln!("  {} : {}", unit, qty);
+        }
+    }
 
     let wallet_utxos = kupo.get(&cfg.sender_bech32, true).await
         .context("fetching wallet UTxOs from Kupo")?;
@@ -472,14 +534,11 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Exclude collateral UTxO and order UTxOs from fee coin selection.
+    // Exclude collateral UTxO from fee coin selection. (Cancel UTxOs live at
+    // the script address, NOT at sender_bech32, so they cannot appear in
+    // wallet_utxos here — no need to filter for them.)
     let collateral_ref_key: Option<(String, u64)> = collateral.as_ref()
         .map(|(u, _)| (u.tx_hash.clone(), u.output_index as u64));
-
-    // Build set of script-input UTxO keys to exclude.
-    let script_utxo_keys: std::collections::HashSet<(String, u64)> = plan.cancels.iter()
-        .map(|s| (s.utxo.tx_hash.clone(), s.utxo.output_index as u64))
-        .collect();
 
     let mut ada_candidates: Vec<(String, u64, u64)> = vec![]; // (tx_hash, output_index, lovelace)
     for u in &wallet_utxos {
@@ -492,10 +551,6 @@ async fn main() -> Result<()> {
                 continue;
             }
         }
-        // Exclude script inputs (cancel order UTxOs).
-        if script_utxo_keys.contains(&(u.tx_hash.clone(), u.output_index as u64)) {
-            continue;
-        }
         let qty: u64 = u.amount[0].quantity.parse().unwrap_or(0);
         ada_candidates.push((u.tx_hash.clone(), u.output_index as u64, qty));
     }
@@ -503,26 +558,35 @@ async fn main() -> Result<()> {
 
     let min_change: u64 = 1_500_000;
     let fee_estimate_initial: u64 = 500_000; // generous initial estimate for coin selection
-    let target = total_new_order_lovelace + fee_estimate_initial + min_change;
+    // Target wallet ADA = (new orders + fee + min_change) − cancel-side ADA.
+    // saturating_sub: if cancel-side ADA alone already covers new orders + fee + change,
+    // we still need at least one wallet input for fee payment continuity (skip 0).
+    let target = (total_new_order_lovelace + fee_estimate_initial + min_change)
+        .saturating_sub(total_cancel_lovelace);
 
     let mut wallet_selected: Vec<(String, u64, u64)> = vec![];
     let mut total_wallet_selected: u64 = 0;
     for u in &ada_candidates {
-        if total_wallet_selected >= target {
+        if total_wallet_selected >= target && total_wallet_selected > 0 {
             break;
         }
         wallet_selected.push(u.clone());
         total_wallet_selected += u.2;
     }
-    if total_wallet_selected < target {
+    let total_inputs_lovelace_initial = total_wallet_selected + total_cancel_lovelace;
+    if total_inputs_lovelace_initial < total_new_order_lovelace + fee_estimate_initial + min_change {
         bail!(
-            "insufficient ADA: wallet has {} lovelace (pure-ADA UTxOs), need at least {} for new orders + fee + change",
-            total_wallet_selected, target
+            "insufficient ADA: wallet has {} lovelace (pure-ADA UTxOs) + cancel inputs {} = {}, \
+             need at least {} for new orders + fee + min_change",
+            total_wallet_selected, total_cancel_lovelace,
+            total_inputs_lovelace_initial,
+            total_new_order_lovelace + fee_estimate_initial + min_change
         );
     }
     eprintln!(
-        "selected {} wallet input(s) totalling {} lovelace ({:.6} ADA)",
-        wallet_selected.len(), total_wallet_selected, total_wallet_selected as f64 / 1_000_000.0
+        "selected {} wallet input(s) totalling {} lovelace ({:.6} ADA); total inputs = {} lovelace",
+        wallet_selected.len(), total_wallet_selected, total_wallet_selected as f64 / 1_000_000.0,
+        total_inputs_lovelace_initial
     );
     eprintln!();
 
@@ -542,13 +606,16 @@ async fn main() -> Result<()> {
     //    We only do an eval pass if there are script inputs (cancels).
     let placeholder_ex = ExUnits { mem: 14_000_000, steps: 10_000_000_000 };
     let eval_fee: u64 = 1_000_000;
-    let eval_change = if total_wallet_selected > total_new_order_lovelace + eval_fee {
-        total_wallet_selected - total_new_order_lovelace - eval_fee
-    } else {
-        0
-    };
+    // Eval-pass change includes cancel-side lovelace too (same balance equation
+    // as the real fee loop): change = (wallet + cancel) − new_orders − fee.
+    let eval_total_inputs = total_wallet_selected + total_cancel_lovelace;
+    let eval_change = eval_total_inputs
+        .saturating_sub(total_new_order_lovelace)
+        .saturating_sub(eval_fee);
 
-    let cancel_inputs_for_eval: Vec<Input> = plan.cancels.iter()
+    // Cancel inputs in CANONICAL (sorted) order so positions match spend:N
+    // redeemer indices from Blockfrost evaluate.
+    let cancel_inputs_for_eval: Vec<Input> = sorted_cancels.iter()
         .map(|s| -> Result<Input> {
             Ok(Input::new(parse_hash32(&s.utxo.tx_hash)?, s.utxo.output_index as u64))
         })
@@ -567,17 +634,18 @@ async fn main() -> Result<()> {
         .transpose()?;
 
     // Build the per-cancel placeholder ex_units list (one per cancel input, all placeholder).
-    let placeholder_ex_units: Vec<ExUnits> = plan.cancels.iter()
+    let placeholder_ex_units: Vec<ExUnits> = sorted_cancels.iter()
         .map(|_| placeholder_ex.clone())
         .collect();
 
     // Eval build.
-    let (real_ex_units, total_script_fee, ref_script_fee) = if !plan.cancels.is_empty() {
+    let (real_ex_units, total_script_fee, ref_script_fee) = if !sorted_cancels.is_empty() {
         let tx_for_eval = build_bulk_tx(
             &cancel_inputs_for_eval,
             &wallet_inputs_for_eval,
             collateral_input.clone(),
             &plan,
+            &change_tokens,
             &new_order_addrs,
             sender_pallas.clone(),
             eval_change,
@@ -592,9 +660,9 @@ async fn main() -> Result<()> {
         )?;
         let unsigned_built = tx_for_eval.build_conway_raw()
             .map_err(|e| anyhow!("initial build for eval: {:?}", e))?;
-        eprintln!("evaluating {} script redeemer(s) via Blockfrost...", plan.cancels.len());
+        eprintln!("evaluating {} script redeemer(s) via Blockfrost...", sorted_cancels.len());
         let real_exs = blockfrost_evaluate_all(
-            &client, &cfg.bf_project_id, &unsigned_built.tx_bytes.0, plan.cancels.len()
+            &client, &cfg.bf_project_id, &unsigned_built.tx_bytes.0, sorted_cancels.len()
         ).await.context("Blockfrost /utils/txs/evaluate")?;
 
         eprintln!("✓ script costs per redeemer:");
@@ -614,7 +682,7 @@ async fn main() -> Result<()> {
             0
         };
         eprintln!("total script fee: {} lovelace; ref_script fee: {} lovelace (paid ONCE for all {} cancel(s))",
-            total_script_fee_acc, rsf, plan.cancels.len());
+            total_script_fee_acc, rsf, sorted_cancels.len());
 
         (real_exs, total_script_fee_acc, rsf)
     } else {
@@ -632,20 +700,25 @@ async fn main() -> Result<()> {
     let mut converged = false;
 
     for iter in 0..MAX_ITERS {
+        // Balance: change = (wallet + cancel) − new_orders − fee.
+        // Cancel-input lovelace is consumed; not adding it to change would
+        // leave the tx short by sum(cancel_lovelace) and the ledger rejects.
+        let total_inputs_lovelace = total_wallet_selected + total_cancel_lovelace;
         let needed = total_new_order_lovelace + fee_estimate + min_change;
-        if total_wallet_selected < needed {
+        if total_inputs_lovelace < needed {
             bail!(
-                "wallet inputs ({} lovelace) cannot cover new_orders + fee + min_change = {}",
-                total_wallet_selected, needed
+                "total inputs ({} lovelace = wallet {} + cancels {}) cannot cover new_orders + fee + min_change = {}",
+                total_inputs_lovelace, total_wallet_selected, total_cancel_lovelace, needed
             );
         }
-        let change = total_wallet_selected - total_new_order_lovelace - fee_estimate;
+        let change = total_inputs_lovelace - total_new_order_lovelace - fee_estimate;
 
         let tx = build_bulk_tx(
             &cancel_inputs_for_eval,
             &wallet_inputs_for_eval,
             collateral_input.clone(),
             &plan,
+            &change_tokens,
             &new_order_addrs,
             sender_pallas.clone(),
             change,
@@ -701,12 +774,12 @@ async fn main() -> Result<()> {
     eprintln!("tx hash:    {}", tx_hash_out);
     eprintln!("tx size:    {} bytes", signed.tx_bytes.0.len());
     eprintln!("fee:        {} lovelace ({:.6} ADA)", fee_estimate, fee_estimate as f64 / 1_000_000.0);
-    eprintln!("cancels:    {} script input(s)", plan.cancels.len());
+    eprintln!("cancels:    {} script input(s)", sorted_cancels.len());
     eprintln!("new orders: {} script output(s)", plan.new_orders.len());
-    if plan.cancels.len() > 1 && ref_script_fee > 0 {
+    if sorted_cancels.len() > 1 && ref_script_fee > 0 {
         eprintln!(
             "ref-script fee paid ONCE: {} lovelace (vs {} if separate txs)",
-            ref_script_fee, ref_script_fee * plan.cancels.len() as u64
+            ref_script_fee, ref_script_fee * sorted_cancels.len() as u64
         );
     }
     eprintln!("tx cbor:    {}", tx_cbor);
@@ -759,6 +832,7 @@ fn build_bulk_tx(
     wallet_inputs: &[Input],
     collateral_input: Option<Input>,
     plan: &dexter_kupo_rs::BulkOrderPlan,
+    change_tokens: &std::collections::BTreeMap<String, u64>,
     new_order_addrs: &[PallasAddress],
     sender_addr: PallasAddress,
     change_lovelace: u64,
@@ -821,8 +895,27 @@ fn build_bulk_tx(
         tx = tx.output(out);
     }
 
-    // Change output.
-    tx = tx.output(Output::new(sender_addr, change_lovelace));
+    // Change output — carries leftover ADA + any tokens from cancel inputs
+    // that weren't consumed by new-order outputs. Missing this attachment
+    // would leave tokens consumed-but-not-produced and the ledger rejects.
+    let mut change_out = Output::new(sender_addr, change_lovelace);
+    for (unit, qty) in change_tokens {
+        if *qty == 0 {
+            continue;
+        }
+        if unit.len() < 56 {
+            bail!("malformed change-token unit: {}", unit);
+        }
+        let (policy_hex, name_hex) = unit.split_at(56);
+        let policy: [u8; 28] = hex::decode(policy_hex)?
+            .try_into()
+            .map_err(|_| anyhow!("policy id on change token not 28 bytes"))?;
+        let name: Vec<u8> = hex::decode(name_hex)?;
+        change_out = change_out
+            .add_asset(Hash::<28>::from(policy), name, *qty)
+            .map_err(|e| anyhow!("add_asset on change output: {:?}", e))?;
+    }
+    tx = tx.output(change_out);
 
     // Reference input (ONE for all cancels — the cost win).
     if let Some(ref_input) = validator_reference {
@@ -940,13 +1033,16 @@ async fn blockfrost_evaluate_all(
         bail!("could not parse evaluate response: {}", body);
     }
 
-    // Verify all N redeemers were returned.
+    // Verify all N redeemers were returned. Report the ACTUAL number of
+    // resolved entries in the error (was previously echoing the expected
+    // count for both args, which obscured the size of the gap).
+    let actual_returned = results.iter().filter(|r| r.is_some()).count();
     let resolved: Result<Vec<ExUnits>> = results.into_iter().enumerate()
         .map(|(i, opt)| {
             opt.ok_or_else(|| anyhow!(
-                "Blockfrost evaluate response missing spend:{} (only returned {} redeemers). \
-                 Full response: {}",
-                i, n_cancels, body
+                "Blockfrost evaluate response missing spend:{} \
+                 (only returned {} redeemers out of {} expected). Full response: {}",
+                i, actual_returned, n_cancels, body
             ))
         })
         .collect();
