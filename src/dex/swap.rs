@@ -3,7 +3,7 @@
 //! Kept separate from `BaseDex` (reading) so the reading and writing surfaces
 //! don't entangle. A DEX impl can implement both.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use crate::models::{LiquidityPool, Token, Utxo};
 use crate::requests::{PayToAddress, SwapFee, SwapParams};
@@ -50,6 +50,12 @@ pub trait DexSwap: Send + Sync {
         for utxo in cancels {
             let cancel_pays = self.build_cancel_order(&[utxo.clone()], return_address)?;
             for pay in cancel_pays {
+                if pay.spend_utxos.is_empty() {
+                    return Err(anyhow!(
+                        "build_bulk_orders: build_cancel_order returned a PayToAddress with empty spend_utxos for cancel of {}; expected at least one script input",
+                        utxo.tx_hash
+                    ));
+                }
                 for spend in pay.spend_utxos {
                     all_cancels.push(spend);
                 }
@@ -58,13 +64,17 @@ pub trait DexSwap: Send + Sync {
 
         // Pure swaps
         for swap in swaps {
-            let mut pays = self.build_swap_order(pool, swap)?;
+            let pays = self.build_swap_order(pool, swap)?;
             if pays.is_empty() {
                 anyhow::bail!("build_swap_order returned empty list for a bulk swap item");
             }
-            // Clear any spend_utxos — the new order is a fresh output only
-            for pay in &mut pays {
-                pay.spend_utxos.clear();
+            for p in &pays {
+                if !p.spend_utxos.is_empty() {
+                    return Err(anyhow!(
+                        "build_bulk_orders: build_swap_order returned a PayToAddress with non-empty spend_utxos ({} entries); the bulk path assumes new orders carry no script inputs of their own — DEX impls that need co-inputs must override build_bulk_orders",
+                        p.spend_utxos.len()
+                    ));
+                }
             }
             all_new_orders.extend(pays);
         }
@@ -74,17 +84,28 @@ pub trait DexSwap: Send + Sync {
             // Cancel half
             let cancel_pays = self.build_cancel_order(&[old_utxo.clone()], return_address)?;
             for pay in cancel_pays {
+                if pay.spend_utxos.is_empty() {
+                    return Err(anyhow!(
+                        "build_bulk_orders: build_cancel_order returned a PayToAddress with empty spend_utxos for cancel of {}; expected at least one script input",
+                        old_utxo.tx_hash
+                    ));
+                }
                 for spend in pay.spend_utxos {
                     all_cancels.push(spend);
                 }
             }
             // Place half
-            let mut pays = self.build_swap_order(pool, new_params)?;
+            let pays = self.build_swap_order(pool, new_params)?;
             if pays.is_empty() {
                 anyhow::bail!("build_swap_order returned empty list for a bulk update item");
             }
-            for pay in &mut pays {
-                pay.spend_utxos.clear();
+            for p in &pays {
+                if !p.spend_utxos.is_empty() {
+                    return Err(anyhow!(
+                        "build_bulk_orders: build_swap_order returned a PayToAddress with non-empty spend_utxos ({} entries); the bulk path assumes new orders carry no script inputs of their own — DEX impls that need co-inputs must override build_bulk_orders",
+                        p.spend_utxos.len()
+                    ));
+                }
             }
             all_new_orders.extend(pays);
         }

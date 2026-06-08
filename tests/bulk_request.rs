@@ -57,6 +57,12 @@ fn bulk_of_one_swap_matches_single_swap_request() {
     let single = dex.build_swap_order(&crate_test::test_pool(), &params).expect("single build");
     assert_eq!(bulk.new_orders[0].datum, single[0].datum,
                "bulk-of-1 swap must produce identical datum to single SwapRequest");
+    assert_eq!(bulk.new_orders[0].address, single[0].address,
+               "bulk-of-1 swap must produce identical script address");
+    assert_eq!(bulk.new_orders[0].assets.len(), single[0].assets.len(),
+               "bulk-of-1 swap must produce same number of asset entries");
+    assert!(bulk.new_orders[0].spend_utxos.is_empty(),
+            "bulk swap output must have no spend_utxos");
 }
 
 #[test]
