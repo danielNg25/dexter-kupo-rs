@@ -55,3 +55,7 @@ path = "examples/live_cancel.rs"
 [[example]]
 name = "live_update"
 path = "examples/live_update.rs"
+
+[[example]]
+name = "live_bulk"
+path = "examples/live_bulk.rs"
