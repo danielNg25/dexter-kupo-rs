@@ -28,6 +28,20 @@ pub trait DexSwap: Send + Sync {
         return_address: &str,
     ) -> Result<Vec<PayToAddress>>;
 
+    /// Bundle multiple order actions into a single `BulkOrderPlan`.
+    ///
+    /// Default impl bails; Task 2 will replace this with a proper composition
+    /// of `build_swap_order` + `build_cancel_order` per item.
+    fn build_bulk_orders(
+        &self,
+        _cancels: &[crate::models::Utxo],
+        _swaps: &[crate::requests::types::SwapParams],
+        _updates: &[(crate::models::Utxo, crate::requests::types::SwapParams)],
+        _return_address: &str,
+    ) -> anyhow::Result<crate::requests::bulk::BulkOrderPlan> {
+        anyhow::bail!("DexSwap::build_bulk_orders default impl not yet wired (Task 2)")
+    }
+
     /// Build a single-tx update of an existing order: spend the old order with
     /// the cancel redeemer AND create a new order at the same script address
     /// with `new_swap_params`. Default impl composes `build_swap_order` and
