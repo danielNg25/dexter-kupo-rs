@@ -209,7 +209,7 @@ checksum = "facfae029ec4373769eb4bd936bcf537de1052abaee9f246e667c9443be6aa95"
 
 [[package]]
 name = "dexter-kupo-rs"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
